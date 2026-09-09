@@ -533,7 +533,7 @@ if ! skip_has saml; then
     done <<< "$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | awk '{print $2}' || true)"
 
     # Signature stripping test via /saml/acs — send stripped assertion
-    ACS_URL=$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | grep "saml/acs\|saml/login" | head -1 | awk '{print $2}' || true)
+    ACS_URL=$(cat "$FINDINGS_DIR/saml/endpoints.txt" 2>/dev/null | grep "saml/acs\|saml/login" | head -1 | awk '{print $3}' || true)
     if [ -n "$ACS_URL" ]; then
         if unsafe_method_guard "POST" "$ACS_URL" "SAML signature-stripping probe"; then
             # Minimal stripped SAMLResponse (no Signature element, NameID = admin)
