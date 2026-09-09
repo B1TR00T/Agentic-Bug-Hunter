@@ -559,6 +559,117 @@ def run_vuln_scan(domain, quick=False):
         return False
 
 
+# cors_scanner.py's severity axis (how bad, if real) is not the same axis as
+# vuln_scanner.sh's confidence tags (how sure the tool is it's real) -- CORS
+# findings are directly observed HTTP header behavior, not a timing/heuristic
+# guess, so this mapping is about how actionable each severity tier is on its
+# own: CRITICAL/HIGH (credentialed reflection) -> CONFIRMED; MEDIUM
+# (exploitability depends on caller-specific factors, per cors_scanner's own
+# note text) -> POSSIBLE; LOW/INFO ("usually intended" per cors_scanner's own
+# docstring) -> INFORMATIONAL.
+_CORS_SEVERITY_TO_CONFIDENCE = {
+    "CRITICAL": "CONFIRMED",
+    "HIGH": "CONFIRMED",
+    "MEDIUM": "POSSIBLE",
+    "LOW": "INFORMATIONAL",
+    "INFO": "INFORMATIONAL",
+}
+
+
+def _cors_finding_to_line(finding):
+    """Translate one cors_scanner.py --json finding dict into the
+    "[TAG] [SUBCAT] url ..." line convention vuln_scanner.sh's checks
+    already write, so findings_correlator.py's existing text-line parser
+    picks it up with zero changes on its side.
+    """
+    severity = finding.get("severity", "INFO")
+    confidence = _CORS_SEVERITY_TO_CONFIDENCE.get(severity, "INFORMATIONAL")
+    subcat = f"CORS-{severity}"
+    url = finding.get("url", "")
+    origin = finding.get("origin_sent", "")
+    acao = finding.get("acao", "")
+    acac = finding.get("acac", "")
+    note = finding.get("note", "")
+    line = f"[{confidence}] [{subcat}] {url} | origin={origin} acao={acao} acac={acac}"
+    if note:
+        line += f" note={note}"
+    return line
+
+
+def run_cors_scan(domain):
+    """Run cors_scanner.py against this target's live URLs and translate
+    its JSON findings into vuln_scanner.sh's [TAG] [SUBCAT] url line
+    convention, written to findings/<domain>/cors/findings.txt.
+
+    Deliberately NOT adding JSON support to findings_correlator.py itself
+    for this: that would mean every future JSON-emitting Python tool
+    (nosqli_scanner.py, jwt_scanner.py, ...) needs its own parsing branch
+    inside a script whose whole design goal is staying a dumb,
+    format-agnostic aggregator ("no chain reasoning, no severity guessing,
+    just the grouped facts" per its own docstring) -- and each tool's JSON
+    shape and severity vocabulary differs, so that branch would be
+    per-tool logic living in the "wrong" file either way. Keeping
+    translation here, in each tool's own glue function, means the
+    correlator never has to change when a new scanner gets wired in -- it
+    just needs one more *.txt file in the format it already understands.
+    The raw JSON is preserved alongside the translated lines
+    (cors_scanner_raw.json) so a human/Claude can still read the
+    full-fidelity origin/ACAO/ACAC detail directly, not just the
+    coarse-grained line format.
+
+    Best-effort only, same pattern as run_findings_correlator(): a bug
+    here must not take down the rest of hunt_target()'s output.
+    """
+    live_urls = os.path.join(RECON_DIR, domain, "live", "urls.txt")
+    if not os.path.isfile(live_urls) or os.path.getsize(live_urls) == 0:
+        return False
+
+    script = os.path.join(TOOLS_DIR, "cors_scanner.py")
+    if not os.path.isfile(script):
+        log("warn", "cors_scanner.py missing — skipping CORS scan")
+        return False
+
+    try:
+        # cors_scanner.py's own CLI convention: exit 0 = clean, exit 2 =
+        # actionable findings present (a grep-style convention for
+        # pipelines) -- NOT an error. run_cmd()'s success boolean only
+        # tracks exit-code-0, so it's deliberately ignored here; whether
+        # stdout parses as the expected JSON array is the real success
+        # signal (a crash/traceback wouldn't parse; a timeout's "Command
+        # timed out..." text from run_cmd() wouldn't either, and falls
+        # into this same except branch).
+        _ok, output = run_cmd(
+            f'python3 "{script}" -l "{live_urls}" --json',
+            cwd=BASE_DIR, timeout=600,
+        )
+        cors_findings = json.loads(output)
+    except Exception as e:  # noqa: BLE001 -- deliberately broad, see
+        # run_findings_correlator()'s docstring for the same reasoning.
+        log("warn", f"cors_scanner.py failed for {domain}: {type(e).__name__}: {e}")
+        return False
+
+    findings_dir = os.path.join(FINDINGS_DIR, domain, "cors")
+    os.makedirs(findings_dir, exist_ok=True)
+
+    try:
+        with open(os.path.join(findings_dir, "cors_scanner_raw.json"), "w", encoding="utf-8") as fh:
+            json.dump(cors_findings, fh, indent=2)
+    except OSError:
+        pass  # raw JSON is a nice-to-have; the .txt lines below are what matters
+
+    lines_path = os.path.join(findings_dir, "findings.txt")
+    try:
+        with open(lines_path, "w", encoding="utf-8") as fh:
+            for finding in cors_findings:
+                fh.write(_cors_finding_to_line(finding) + "\n")
+    except OSError as e:
+        log("warn", f"Could not write {lines_path}: {type(e).__name__}: {e}")
+        return False
+
+    log("ok", f"CORS scan: {len(cors_findings)} finding(s) for {domain} — see {lines_path}")
+    return True
+
+
 def run_findings_correlator(domain):
     """Run findings_correlator.py against this target's findings dir and
     print a short "go look at this" summary line -- the same "don't let
@@ -790,6 +901,10 @@ def hunt_target(
         run_graphql_audit(domain)
 
     result["scan"] = run_vuln_scan(domain, quick=quick)
+
+    # CORS misconfiguration scan against this target's live URLs.
+    # Best-effort/non-fatal by design -- see run_cors_scan().
+    run_cors_scan(domain)
 
     # CVE hunting (only when explicitly requested)
     if cve_hunt:
