@@ -106,7 +106,7 @@ _has_skip() {
     [[ ",$source," == *",$want,"* ]] || [[ ",$source," == *",all,"* ]]
 }
 
-skip_has() { _has_skip "${SKIP_CHECKS:-}" "$1" || { [ "$FULL_MODE" != "--full" ] && _has_skip "xss,lfi,ssti,ssrf,cors,takeover,misconfig,jwt,graphql,smuggling,redirects,idor,auth_bypass,host_header,exposure,cloud,race" "$1"; }; }
+skip_has() { _has_skip "${SKIP_CHECKS:-}" "$1" || { [ "$FULL_MODE" != "--full" ] && _has_skip "xss,lfi,ssti,ssrf,cors,takeover,misconfig,jwt,graphql,smuggling,redirects,idor,auth_bypass,host_header,exposure,cloud,race,upload-verify" "$1"; }; }
 
 unsafe_method_guard() {
     local method="$1"
@@ -235,7 +235,12 @@ if ! skip_has upload; then
             if [ "$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "$U")" -eq 200 ]; then
                 log_vuln "Found upload path: $U"
                 echo "[INFORMATIONAL] [UPLOAD-CANDIDATE] $U" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
-                verify_upload_poc "$U"
+                if ! skip_has upload-verify && unsafe_method_guard "POST" "$U" "Upload-RCE PoC"; then
+                    verify_upload_poc "$U"
+                else
+                    echo "[SKIPPED] [UPLOAD-RCE-POC] $U — requires --full and ALLOW_UNSAFE_HTTP_TESTS=1" \
+                        >> "$FINDINGS_DIR/upload/skipped.log"
+                fi
             fi
         done
     done
