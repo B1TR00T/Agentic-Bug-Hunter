@@ -217,13 +217,25 @@ _bb_rate_limit_wait() {
     _BB_LAST_REQUEST_NS=$(date +%s%N)
 }
 
-# ── bb_curl ───────────────────────────────────────────────────────────────────
-# bb_curl <url> [curl-args...]
-# Scope-checks, rate-limits, attaches auth headers, runs curl, logs the
-# request. Returns curl's own exit status on success; 1 if blocked out of
-# scope; 2 if BBHUNT_SCOPE_FILE itself is misconfigured (propagated from
-# is_in_scope).
-bb_curl() {
+# ── Public: rate-limit wait only, no request ─────────────────────────────────
+# For callers that measure precise request timing (e.g. SQLi time-based
+# blind detection) and must not have the rate-limit sleep land inside their
+# measured window. Call this explicitly BEFORE capturing the start
+# timestamp, then fire the request with bb_curl_no_wait() (not bb_curl())
+# so the wait isn't applied a second time.
+bb_rate_limit_wait() {
+    _bb_rate_limit_wait
+}
+
+# ── Internal: shared implementation behind bb_curl / bb_curl_no_wait /
+#    bb_curl_no_auth ──────────────────────────────────────────────────────────
+# _bb_curl_impl <do_rate_limit:0|1> <do_auth:0|1> <url> [curl-args...]
+# All three public entry points delegate here so scope-checking, logging,
+# and the curl invocation itself stay in exactly one place — only whether
+# the rate-limit wait and auth-header attachment happen is parameterized.
+_bb_curl_impl() {
+    local do_rate_limit="$1" do_auth="$2"
+    shift 2
     local url="$1"
     if [ -z "$url" ]; then
         echo "[bb_curl] usage: bb_curl <url> [curl-args...]" >&2
@@ -239,10 +251,10 @@ bb_curl() {
         return "$scope_rc"
     fi
 
-    _bb_rate_limit_wait
+    [ "$do_rate_limit" = "1" ] && _bb_rate_limit_wait
 
     local -a auth_args=()
-    if [ -n "${BBHUNT_AUTH_HEADERS:-}" ]; then
+    if [ "$do_auth" = "1" ] && [ -n "${BBHUNT_AUTH_HEADERS:-}" ]; then
         local _bb_h
         while IFS= read -r _bb_h; do
             case "$_bb_h" in
@@ -261,4 +273,37 @@ bb_curl() {
     _bb_audit_log "[REQUEST] url=$url"
 
     curl "${auth_args[@]}" "$url" "$@"
+}
+
+# ── bb_curl ───────────────────────────────────────────────────────────────────
+# bb_curl <url> [curl-args...]
+# Scope-checks, rate-limits, attaches auth headers, runs curl, logs the
+# request. Returns curl's own exit status on success; 1 if blocked out of
+# scope; 2 if BBHUNT_SCOPE_FILE itself is misconfigured (propagated from
+# is_in_scope). This is the default, unchanged entry point — most callers
+# should use this one.
+bb_curl() {
+    _bb_curl_impl 1 1 "$@"
+}
+
+# ── bb_curl_no_wait ───────────────────────────────────────────────────────────
+# bb_curl_no_wait <url> [curl-args...]
+# Same as bb_curl(), but skips its own internal rate-limit wait. Pair with
+# an explicit bb_rate_limit_wait() call made BEFORE starting a timing
+# measurement — see the comment on bb_rate_limit_wait() above. Calling this
+# without a preceding bb_rate_limit_wait() does NOT rate-limit the request
+# at all; that responsibility moves to the caller.
+bb_curl_no_wait() {
+    _bb_curl_impl 0 1 "$@"
+}
+
+# ── bb_curl_no_auth ───────────────────────────────────────────────────────────
+# bb_curl_no_auth <url> [curl-args...]
+# Same as bb_curl(), but never attaches BBHUNT_AUTH_HEADERS, even if set.
+# For probes that must stay deliberately unauthenticated (e.g. checking
+# whether an endpoint is reachable without credentials) rather than callers
+# that simply have no auth session configured — bb_curl() already omits
+# headers on its own when BBHUNT_AUTH_HEADERS is unset.
+bb_curl_no_auth() {
+    _bb_curl_impl 1 0 "$@"
 }
