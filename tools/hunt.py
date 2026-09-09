@@ -559,6 +559,54 @@ def run_vuln_scan(domain, quick=False):
         return False
 
 
+def run_findings_correlator(domain):
+    """Run findings_correlator.py against this target's findings dir and
+    print a short "go look at this" summary line -- the same "don't let
+    people forget a step exists" problem chain-builder has today, where a
+    useful step only happens if the hunter remembers to run it manually.
+
+    Best-effort only: never raises past this function. A bug in the
+    correlator (missing script, non-zero exit, timeout, malformed output
+    JSON) must not take down the rest of hunt_target()'s output, so every
+    failure mode here is caught and logged as a warning instead.
+    """
+    findings_dir = os.path.join(FINDINGS_DIR, domain)
+    if not os.path.isdir(findings_dir):
+        return False
+
+    script = os.path.join(TOOLS_DIR, "findings_correlator.py")
+    if not os.path.isfile(script):
+        log("warn", "findings_correlator.py missing — skipping cross-check correlation")
+        return False
+
+    out_path = os.path.join(findings_dir, "correlated_groups.json")
+
+    try:
+        ok, output = run_cmd(
+            f'python3 "{script}" "{domain}" --findings-dir "{findings_dir}" --out "{out_path}"',
+            cwd=BASE_DIR, timeout=120,
+        )
+        if not ok:
+            log("warn", f"findings_correlator.py failed for {domain}: {output.strip()[-300:]}")
+            return False
+
+        with open(out_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        groups = payload.get("groups", [])
+        n_groups = len(groups)
+        n_hosts = len({g.get("host") for g in groups if g.get("host")})
+        rel_out = os.path.relpath(out_path, BASE_DIR)
+        if n_groups:
+            log("ok", f"Correlator found {n_groups} group(s) across {n_hosts} host(s) — see {rel_out}")
+        else:
+            log("info", f"Correlator ran for {domain} — no host had 2+ findings, nothing to review")
+        return True
+    except Exception as e:  # noqa: BLE001 -- deliberately broad: a correlator
+        # bug must never take down the rest of hunt_target()'s output.
+        log("warn", f"findings_correlator.py errored for {domain}: {type(e).__name__}: {e}")
+        return False
+
+
 def generate_reports(domain):
     """Generate reports for findings."""
     log("warn", "report_generator.py has been removed. Use /report in Claude Code to generate reports.")
@@ -753,6 +801,10 @@ def hunt_target(
         run_zero_day_fuzzer(domain, deep=not quick)
 
     result["reports"] = generate_reports(domain)
+
+    # Cross-check correlation across every category's findings output.
+    # Best-effort/non-fatal by design -- see run_findings_correlator().
+    run_findings_correlator(domain)
 
     return result
 
