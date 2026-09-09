@@ -307,3 +307,18 @@ bb_curl_no_wait() {
 bb_curl_no_auth() {
     _bb_curl_impl 1 0 "$@"
 }
+
+# ── bb_curl_no_wait_no_auth ───────────────────────────────────────────────────
+# bb_curl_no_wait_no_auth <url> [curl-args...]
+# Combines bb_curl_no_wait() and bb_curl_no_auth(): skips both the internal
+# rate-limit wait and auth-header attachment. For a deliberate, rapid,
+# unauthenticated burst where the burst's own speed is what's being tested
+# (e.g. firing N rapid guesses to check whether a target rate-limits them) —
+# pacing between the individual requests in the burst would invalidate the
+# test, and the burst is inherently unauthenticated (testing a pre-auth
+# attacker's surface). Call bb_rate_limit_wait() ONCE before the burst
+# starts if you want normal pacing relative to whatever ran immediately
+# before it — the requests inside the burst itself should not each wait.
+bb_curl_no_wait_no_auth() {
+    _bb_curl_impl 0 0 "$@"
+}
