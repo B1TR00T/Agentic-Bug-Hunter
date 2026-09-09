@@ -42,7 +42,7 @@ from tools.safe_http import safe_urlopen  # noqa: E402
 
 USER_AGENT = "agentic-bug-hunter/cors_scanner"
 
-CRITICAL, HIGH, MEDIUM, LOW, INFO = "CRITICAL", "HIGH", "MEDIUM", "MEDIUM_LOW", "INFO"
+CRITICAL, HIGH, MEDIUM, LOW, INFO = "CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"
 
 
 @dataclass
@@ -74,11 +74,6 @@ class CorsFinding:
             "title": self.title,
             "note": self.note,
         }
-
-
-def _registrable(host: str) -> str:
-    """Best-effort 'evil-attached' base for suffix/prefix tricks (no PSL dep)."""
-    return host
 
 
 def generate_tests(url: str, attacker: str = "evil.example") -> list[CorsTest]:
@@ -143,7 +138,7 @@ def classify(
                 "ACAO:* + ACAC:true is invalid per spec; signals a broken CORS layer.",
             )
         return CorsFinding(
-            url, sent, acao, acac, INFO,
+            url, sent, acao, acac, LOW,
             "Public wildcard CORS (ACAO: *)",
             "Only a finding if the endpoint returns sensitive data without a cookie.",
         )
@@ -209,15 +204,18 @@ def scan(url: str, cookie: str | None = None, timeout: int = 15) -> list[CorsFin
     return findings
 
 
-_SEV_ORDER = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, INFO: 4}
+_SEV_ORDER = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4}
 
 
 def _print_human(url: str, findings: list[CorsFinding]) -> None:
     if not findings:
         print(f"[ok] {url} — no CORS misconfiguration detected")
         return
-    real = [f for f in findings if f.severity != INFO]
-    for f in sorted(findings, key=lambda x: _SEV_ORDER.get(x.severity, 3)):
+    # LOW ("usually intended" per the severity model above) is treated like
+    # INFO here -- present in the JSON/output for completeness, but not
+    # counted toward "actionable" the way CRITICAL/HIGH/MEDIUM are.
+    real = [f for f in findings if f.severity not in (INFO, LOW)]
+    for f in sorted(findings, key=lambda x: _SEV_ORDER.get(x.severity, 5)):
         print(f"[{f.severity}] {f.title}")
         print(f"    url:    {f.url}")
         print(f"    origin: {f.origin_sent}  ->  ACAO: {f.acao}  ACAC: {f.acac}")
@@ -253,8 +251,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         print(json.dumps([f.as_dict() for f in all_findings], indent=2))
-    # exit 2 if any actionable (non-INFO) finding — useful in pipelines
-    return 2 if any(f.severity != INFO for f in all_findings) else 0
+    # exit 2 if any actionable (non-INFO, non-LOW) finding — useful in pipelines
+    return 2 if any(f.severity not in (INFO, LOW) for f in all_findings) else 0
 
 
 if __name__ == "__main__":
