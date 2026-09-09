@@ -30,6 +30,29 @@ BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=tools/_auth_helper.sh
 . "$(dirname "$0")/_auth_helper.sh"
 
+# bb_curl() wraps curl with scope + rate-limit enforcement (tools/bb_curl.sh).
+# Wired into Phase 5 (JS fetch) and Phase 6.5 (config-exposure probe) only —
+# every other phase in this script is untouched and still uses BB_AUTH_ARGS /
+# raw curl (or httpx/katana/nuclei's own -H flags) directly.
+# shellcheck source=tools/bb_curl.sh
+. "$(dirname "$0")/bb_curl.sh"
+
+# bb_curl() refuses every request without BBHUNT_SCOPE_FILE set to an
+# existing scope file (fail-loud, fail-closed — see is_in_scope() in
+# bb_curl.sh). Check that up front, before Phase 1 even starts, so a missing
+# scope file surfaces immediately instead of after minutes of subdomain
+# enum/nmap/etc., only to fail cryptically once Phase 5 is reached.
+if [ -z "${BBHUNT_SCOPE_FILE:-}" ] || [ ! -f "${BBHUNT_SCOPE_FILE:-/nonexistent}" ]; then
+    log_err "BBHUNT_SCOPE_FILE is not set, or does not point to an existing file."
+    log_err "Phase 5 (JS fetch) and Phase 6.5 (config-exposure probe) route their"
+    log_err "requests through bb_curl(), which refuses to run without a scope file."
+    log_err "Create one and re-run, e.g.:"
+    log_err "  echo '$TARGET' > /tmp/${TARGET}-scope.txt"
+    log_err "  echo '*.$TARGET' >> /tmp/${TARGET}-scope.txt"
+    log_err "  BBHUNT_SCOPE_FILE=/tmp/${TARGET}-scope.txt bash tools/recon_engine.sh $TARGET"
+    exit 1
+fi
+
 # Domain-list mode: if the target is a readable regular file, treat its
 # contents as a pre-resolved scope list (one host per line, # comments OK).
 # Useful for programs without wildcards where subdomain enum is wasted work.
@@ -417,7 +440,7 @@ if [ -s "$RECON_DIR/urls/js_files.txt" ]; then
     mkdir -p "$RECON_DIR/js"
 
     head -50 "$RECON_DIR/urls/js_files.txt" | while IFS= read -r js_url; do
-        curl -s --max-time 10 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$js_url" 2>/dev/null | \
+        bb_curl "$js_url" -s --max-time 10 2>/dev/null | \
             sed -nE 's/.*["'"'"']([a-zA-Z0-9_/.-]*(\/[a-zA-Z0-9_/.-]+)+)["'"'"'].*/\1/p' \
             >> "$RECON_DIR/js/endpoints_raw.txt" 2>/dev/null || true
     done
@@ -428,7 +451,7 @@ if [ -s "$RECON_DIR/urls/js_files.txt" ]; then
 
         # Extract potential secrets from JS
         head -50 "$RECON_DIR/urls/js_files.txt" | while IFS= read -r js_url; do
-            curl -s --max-time 10 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "$js_url" 2>/dev/null | \
+            bb_curl "$js_url" -s --max-time 10 2>/dev/null | \
                 grep -oiE '(api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|client[_-]?secret|password|secret[_-]?key)["\s]*[:=]["\s]*[a-zA-Z0-9_\-]{8,}' \
                 >> "$RECON_DIR/js/potential_secrets.txt" 2>/dev/null || true
         done
@@ -521,9 +544,9 @@ if [ -s "$RECON_DIR/live/urls.txt" ]; then
 
     while IFS= read -r base_url; do
         for path in "${CONFIG_PATHS[@]}"; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "${base_url}${path}" 2>/dev/null || echo "000")
+            STATUS=$(bb_curl "${base_url}${path}" -s -o /dev/null -w "%{http_code}" --max-time 5 2>/dev/null || echo "000")
             if [ "$STATUS" = "200" ]; then
-                CONTENT_TYPE=$(curl -sI --max-time 5 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} "${base_url}${path}" 2>/dev/null | grep -i content-type | head -1)
+                CONTENT_TYPE=$(bb_curl "${base_url}${path}" -sI --max-time 5 2>/dev/null | grep -i content-type | head -1)
                 # Only flag if it returns JS/JSON/text (not HTML error pages)
                 if echo "$CONTENT_TYPE" | grep -qiE '(javascript|json|text/plain)'; then
                     echo "[EXPOSED] ${base_url}${path}" >> "$RECON_DIR/exposure/config_files.txt"
