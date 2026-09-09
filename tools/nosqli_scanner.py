@@ -17,6 +17,11 @@ Usage:
   tools/nosqli_scanner.py --login https://t/api/login --user-field email --pass-field password
   tools/nosqli_scanner.py --login https://t/api/login --baseline-user a@a.co --baseline-pass wrong
   tools/nosqli_scanner.py --query "https://t/api/items?id=1"
+
+The operator-auth-bypass burst and the $where sleep probe require
+ALLOW_UNSAFE_HTTP_TESTS=1 in the environment (same gate/convention as
+vuln_scanner.sh/bb_curl.sh) -- without it, --login only sends the single
+baseline request and prints [SKIPPED] lines for the two gated actions.
 """
 from __future__ import annotations
 
@@ -138,12 +143,34 @@ def scan_login(
     baseline_user: str = "nouser@example.invalid",
     baseline_pass: str = "definitely-wrong-pw",
     timeout: int = 20,
+    delay_sec: float = 0.5,
 ) -> list[NoSqlFinding]:
+    """Baseline login attempt always fires (a single wrong-password login is
+    normal traffic). The operator-auth-bypass burst and the $where sleep
+    probe are gated behind ALLOW_UNSAFE_HTTP_TESTS=1 -- same env var,
+    same convention as unsafe_method_guard() in vuln_scanner.sh/bb_curl.sh --
+    since both send real injection payloads to a live login endpoint and the
+    sleep probe deliberately hangs the server for ~5s. Without the gate,
+    both are skipped and a [SKIPPED] line explains why, mirroring
+    vuln_scanner.sh's skipped.log messages.
+    """
     findings: list[NoSqlFinding] = []
     b_status, b_len, b_ms = _post_json(
         url, {user_field: baseline_user, pass_field: baseline_pass}, timeout
     )
-    for body in auth_bypass_bodies(user_field, pass_field):
+
+    bodies = auth_bypass_bodies(user_field, pass_field)
+
+    if os.environ.get("ALLOW_UNSAFE_HTTP_TESTS", "0") != "1":
+        print(f"[SKIPPED] [NOSQLI-AUTH-BYPASS-BURST] {url} — requires ALLOW_UNSAFE_HTTP_TESTS=1 "
+              f"(sends {len(bodies)} operator-injection login attempts)")
+        print(f"[SKIPPED] [NOSQLI-WHERE-SLEEP] {url} — requires ALLOW_UNSAFE_HTTP_TESTS=1 "
+              f"(deliberate ~5s server-side delay probe)")
+        return findings
+
+    for i, body in enumerate(bodies):
+        if i > 0:
+            time.sleep(delay_sec)  # pace the burst instead of firing back-to-back
         t_status, t_len, _ = _post_json(url, body, timeout)
         if classify_differential(b_status, b_len, t_status, t_len):
             findings.append(NoSqlFinding(
