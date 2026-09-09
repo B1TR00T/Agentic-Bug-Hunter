@@ -56,7 +56,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Directory names under findings/<target>/ that vuln_scanner.sh's checks
 # write [TAG]-format lines into. "cms" is listed for forward compatibility
 # even though no such directory exists today -- see module docstring.
-CATEGORIES = ["upload", "sqli", "ssti", "cms", "mfa", "saml"]
+CATEGORIES = ["upload", "sqli", "ssti", "cms", "mfa", "saml", "cors"]
 
 CONFIDENCE_TAGS = ("CONFIRMED", "POSSIBLE", "INFORMATIONAL")
 _CONFIDENCE_RE = re.compile(r"^\[(" + "|".join(CONFIDENCE_TAGS) + r")\]")
