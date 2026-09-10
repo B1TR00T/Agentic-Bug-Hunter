@@ -66,17 +66,60 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 bb_auth_active && bb_auth_banner
 
 # bb_curl() wraps curl with scope + rate-limit enforcement (tools/bb_curl.sh).
-# Wired into Check 0 (upload) and Check 2 (SQLi) only, including their
-# verify_upload_poc()/verify_sqli_poc() helper calls — every other check in
-# this file is untouched and still uses BB_AUTH_ARGS / raw curl directly.
-# Requires BBHUNT_SCOPE_FILE to be set to an existing scope file, same as
-# recon_engine.sh — bb_curl fails loud/closed without it (see is_in_scope()
-# in bb_curl.sh). Unlike recon_engine.sh, there's no up-front pre-flight
-# check here yet, so an unset/missing BBHUNT_SCOPE_FILE will surface as a
-# [FATAL] message from the first bb_curl call inside Check 0 or Check 2,
-# not before either check starts.
+# Wired into Check 0 (upload), 2 (SQLi), 4 (SSTI), 7 (CMS), 8 (MFA), and 9
+# (SAML), including verify_upload_poc()/verify_sqli_poc(); Check 2a (nuclei)
+# and Check 3 (dalfox) call their own binaries directly and are handled
+# separately below (see the BBHUNT_USER_AGENT_SUFFIX preflight comment).
+# Requires BBHUNT_SCOPE_FILE to be set to an existing scope file — bb_curl
+# fails loud/closed without it (see is_in_scope() in bb_curl.sh). Checked
+# up front immediately below, same fail-loud/fail-closed pattern and same
+# place in the script as recon_engine.sh's own scope preflight.
 # shellcheck source=tools/bb_curl.sh
 . "$SCRIPT_DIR/bb_curl.sh"
+
+# See the comment above bb_curl.sh's source line: check BBHUNT_SCOPE_FILE
+# up front, before Check 0 even starts, so a missing scope file surfaces
+# immediately instead of failing cryptically deep inside whichever check
+# happens to call bb_curl first. $RECON_DIR is used for the example scope
+# entry below (rather than $TARGET) because TARGET isn't derived until
+# later in this script; RECON_DIR's basename is what TARGET will end up
+# being anyway once it is set (see the SESSION_ID/TARGET block below).
+#
+# This gate only checks that BBHUNT_SCOPE_FILE itself is set and readable --
+# it does not by itself scope-check every URL. Check 0/2b/4/7/8/9 get that
+# per-URL check for free from bb_curl()'s own is_in_scope() call. Check 2a
+# (nuclei) and Check 3 (dalfox) bypass bb_curl entirely and would otherwise
+# bypass its scope filtering too, not just its attribution -- see
+# bb_filter_scope_list() (tools/bb_curl.sh) and its two call sites below,
+# which close exactly that gap by pre-filtering $ORDERED_SCAN/$PARAMS_FILE
+# against the same scope file before either binary ever sees them.
+if [ -z "${BBHUNT_SCOPE_FILE:-}" ] || [ ! -f "${BBHUNT_SCOPE_FILE:-/nonexistent}" ]; then
+    log_err "BBHUNT_SCOPE_FILE is not set, or does not point to an existing file."
+    log_err "bb_curl(), used by most checks in this scanner, refuses to run without one."
+    log_err "Create one and re-run, e.g.:"
+    log_err "  echo '$(basename "$RECON_DIR")' > /tmp/$(basename "$RECON_DIR")-scope.txt"
+    log_err "  echo '*.$(basename "$RECON_DIR")' >> /tmp/$(basename "$RECON_DIR")-scope.txt"
+    log_err "  BBHUNT_SCOPE_FILE=/tmp/$(basename "$RECON_DIR")-scope.txt bash tools/vuln_scanner.sh $RECON_DIR"
+    exit 1
+fi
+
+# Every outbound request this scanner sends must be identifiable as coming
+# from a specific hacker — same fail-loud/fail-closed requirement as
+# recon_engine.sh's preflight, and checked just as early here, before Check
+# 0 even starts. bb_curl()/bb_curl_no_auth()/bb_curl_no_wait() calls (Check
+# 0/2/4/7/8/9) already enforce this on their own via bb_curl.sh; this gate
+# additionally covers the two checks that invoke a scanner binary directly
+# and bypass bb_curl entirely: nuclei (Check 2a) and dalfox (Check 3), fixed
+# below via -H / --user-agent respectively. Blocking the whole script here
+# means those two also refuse rather than run unattributed just because
+# they don't happen to call bb_curl.
+if ! SCANNER_USER_AGENT="$(_bb_user_agent "agentic-bug-hunter/vuln_scanner")"; then
+    log_err "BBHUNT_USER_AGENT_SUFFIX is not set (or contains a CR/LF) — refusing to run."
+    log_err "Every outbound request this scanner sends must be identifiable as coming"
+    log_err "from a specific hacker. Set it and re-run, e.g.:"
+    log_err "  export BBHUNT_USER_AGENT_SUFFIX='yourhandle (+https://hackerone.com/yourhandle)'"
+    exit 1
+fi
 
 # macOS compatibility: GNU timeout may not exist
 if ! command -v timeout &>/dev/null; then
@@ -268,7 +311,23 @@ if ! skip_has sqli; then
     # 2a. Nuclei
     if tool_ok nuclei; then
         log_step "nuclei SQLi templates..."
-        nuclei -l "$ORDERED_SCAN" -tags sqli -severity medium,high,critical -silent ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} -o "$FINDINGS_DIR/sqli/nuclei_sqli.txt" || true
+        # Direct nuclei invocation -- bypasses bb_curl() entirely, same gap
+        # recon_engine.sh's nuclei call had. `-H, -header` confirmed via
+        # `nuclei -h`.
+        #
+        # nuclei also never calls is_in_scope() itself (it makes its own
+        # requests straight from -l's list), so $ORDERED_SCAN is
+        # scope-filtered into a temp file first via bb_filter_scope_list()
+        # -- which reuses is_in_scope() line-for-line rather than
+        # reimplementing its matching logic -- and nuclei is pointed at
+        # that instead. Any dropped URL is logged the same way a blocked
+        # bb_curl() request would be (see bb_filter_scope_list() in
+        # bb_curl.sh), not silently discarded.
+        NUCLEI_SCOPED_LIST=$(mktemp /tmp/nuclei_scoped_XXXXXX.txt)
+        bb_filter_scope_list "$ORDERED_SCAN" "$NUCLEI_SCOPED_LIST"
+        log_step "Scope-filtered targets: $(file_lines "$ORDERED_SCAN") -> $(file_lines "$NUCLEI_SCOPED_LIST")"
+        nuclei -l "$NUCLEI_SCOPED_LIST" -tags sqli -severity medium,high,critical -silent -H "User-Agent: $SCANNER_USER_AGENT" ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} -o "$FINDINGS_DIR/sqli/nuclei_sqli.txt" || true
+        rm -f "$NUCLEI_SCOPED_LIST"
     fi
     # 2b. Manual Linear-Scaling Probes
     PARAMS_FILE="$RECON_DIR/urls/with_params.txt"
@@ -313,10 +372,22 @@ if ! skip_has xss; then
     if tool_ok dalfox && [ -s "$PARAMS_FILE" ]; then
         DAL_LIMIT=$([ "$QUICK_MODE" = "--quick" ] && echo 30 || echo 100)
         DAL_MAX_TIME=$([ "$QUICK_MODE" = "--quick" ] && echo 300 || echo 900)
+
+        # dalfox never calls is_in_scope() itself -- it makes its own
+        # requests straight from the pipe's stdin -- so $PARAMS_FILE is
+        # scope-filtered into a temp file first via bb_filter_scope_list()
+        # (reuses is_in_scope() line-for-line, same fix as the nuclei call
+        # in Check 2a above) before dedup even runs. Any dropped URL is
+        # logged the same way a blocked bb_curl() request would be.
+        PARAMS_FILE_SCOPED=$(mktemp /tmp/dalfox_scoped_XXXXXX.txt)
+        bb_filter_scope_list "$PARAMS_FILE" "$PARAMS_FILE_SCOPED"
+        SCOPED_COUNT=$(file_lines "$PARAMS_FILE_SCOPED")
+        log_step "Scope-filtered params: $(file_lines "$PARAMS_FILE") -> $SCOPED_COUNT"
+
         # Deduplicate by base-URL + sorted param keys to avoid scanning the same
         # endpoint N times with different random values (e.g. ?rand=1.234 variants)
         DAL_DEDUP_FILE=$(mktemp /tmp/dalfox_dedup_XXXXXX.txt)
-        python3 - "$PARAMS_FILE" "$DAL_DEDUP_FILE" <<'PYEOF' 2>/dev/null || cp "$PARAMS_FILE" "$DAL_DEDUP_FILE"
+        python3 - "$PARAMS_FILE_SCOPED" "$DAL_DEDUP_FILE" <<'PYEOF' 2>/dev/null || cp "$PARAMS_FILE_SCOPED" "$DAL_DEDUP_FILE"
 import sys
 from urllib.parse import urlparse, parse_qs
 seen = set()
@@ -334,15 +405,22 @@ with open(sys.argv[1]) as fin, open(sys.argv[2], 'w') as fout:
             seen.add(key)
             fout.write(url + '\n')
 PYEOF
-        ORIG_COUNT=$(wc -l < "$PARAMS_FILE" 2>/dev/null || echo 0)
-        DEDUP_COUNT=$(wc -l < "$DAL_DEDUP_FILE" 2>/dev/null || echo 0)
-        log_step "Running dalfox on $DAL_LIMIT URLs (deduped $ORIG_COUNT -> $DEDUP_COUNT, timeout: ${DAL_MAX_TIME}s)..."
+        rm -f "$PARAMS_FILE_SCOPED"
+        DEDUP_COUNT=$(file_lines "$DAL_DEDUP_FILE")
+        log_step "Running dalfox on $DAL_LIMIT URLs (deduped $SCOPED_COUNT -> $DEDUP_COUNT, timeout: ${DAL_MAX_TIME}s)..."
+        # Direct dalfox invocation -- bypasses bb_curl() entirely, same gap
+        # recon_engine.sh's httpx/katana/ffuf/nuclei calls had. dalfox has
+        # its own dedicated --user-agent flag (confirmed via
+        # `dalfox pipe -h`) rather than a generic -H, so use that instead
+        # of -H "User-Agent: ..." for consistency with how dalfox expects
+        # it to be set.
         head -"$DAL_LIMIT" "$DAL_DEDUP_FILE" | \
             timeout "$DAL_MAX_TIME" dalfox pipe \
             --silence \
             --no-color \
             --worker 20 \
             --timeout 10 \
+            --user-agent "$SCANNER_USER_AGENT" \
             ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
             --output "$FINDINGS_DIR/xss/dalfox_results.txt" 2>/dev/null || true
         rm -f "$DAL_DEDUP_FILE"
@@ -411,6 +489,9 @@ if ! skip_has cms; then
             MSF_RC="$FINDINGS_DIR/metasploit/${CMS}_$(echo "$url" | sed 's|[^a-z0-9]|_|g').rc"
             # Attempt to resolve IP for RHOSTS reliability
             HOST_PART=$(echo "$url" | cut -d'/' -f3 | cut -d':' -f1)
+            # dig is a DNS lookup, not HTTP -- same structural non-answer as
+            # nmap in recon_engine.sh: DNS queries have no header/UA field
+            # to carry an identifying string in, so there's nothing to add.
             RHOST_VAL=$(dig +short "$HOST_PART" | head -1)
             [ -z "$RHOST_VAL" ] && RHOST_VAL="$HOST_PART"
 
