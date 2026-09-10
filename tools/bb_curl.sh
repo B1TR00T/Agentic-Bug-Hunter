@@ -11,6 +11,11 @@
 #   . "$(dirname "$0")/bb_curl.sh"
 #
 #   export BBHUNT_SCOPE_FILE="recon/target.com/scope.txt"   # required, no default
+#   export BBHUNT_USER_AGENT_SUFFIX="yourhandle (+https://hackerone.com/yourhandle)"
+#                                                            # required, no default —
+#                                                            # every outbound request must be
+#                                                            # identifiable as coming from a
+#                                                            # specific hacker; see _bb_user_agent()
 #   export BBHUNT_RATE_LIMIT_RPS=2                          # optional, default 2
 #   export BBHUNT_AUDIT_LOG="logs/audit.log"                # optional, default shown
 #   export BBHUNT_AUTH_HEADERS=$'Authorization: Bearer xyz\nX-Custom: val'  # optional
@@ -31,9 +36,10 @@
 #   is_in_scope <url>   — returns 0 if in scope, non-zero otherwise. Logs
 #                          blocks and hard config errors to the audit log.
 #   bb_curl <url> [curl-args...] — enforces scope + rate limit, then runs
-#                          curl with BBHUNT_AUTH_HEADERS attached. Logs every
-#                          request it actually sends, and every request it
-#                          blocks, to the audit log.
+#                          curl with BBHUNT_AUTH_HEADERS and an identifying
+#                          User-Agent (BBHUNT_USER_AGENT_SUFFIX) attached.
+#                          Logs every request it actually sends, and every
+#                          request it blocks, to the audit log.
 # =============================================================================
 
 # Guard: source-only, no execution (same pattern as _auth_helper.sh).
@@ -180,6 +186,74 @@ is_in_scope() {
     return 1
 }
 
+# ── bb_filter_scope_list ─────────────────────────────────────────────────────
+# bb_filter_scope_list <input-file> <output-file>
+# For callers that hand an entire URL list to a binary that makes its own
+# requests directly (nuclei -l, dalfox pipe, ...) rather than going through
+# bb_curl() one URL at a time -- those binaries never touch is_in_scope() on
+# their own, so their input needs to be scope-checked before they ever see
+# it. Filters <input-file> (one URL/host per line; blank lines and '#'
+# comments skipped, same convention as a scope file) down to only the
+# lines that pass is_in_scope(), writing the result to <output-file>.
+#
+# Deliberately calls is_in_scope() itself per line rather than reimplementing
+# its matching logic -- same fail-loud behavior on a missing/unreadable
+# BBHUNT_SCOPE_FILE (is_in_scope's own [FATAL...] log entry and non-zero
+# return propagate straight through), and every filtered-out line is logged
+# via is_in_scope()'s own _bb_audit_log calls (e.g. [BLOCKED-OUT-OF-SCOPE]),
+# the exact same log entries a blocked bb_curl() request would produce --
+# not a separate, weaker notion of "filtered". A trailing summary line is
+# added on top so the filtering pass itself (not just each individual drop)
+# shows up in the audit trail.
+#
+# Returns is_in_scope's exit status on a hard config error (2 = scope file
+# itself missing/unreadable) so callers can distinguish "scope file broken"
+# from "every URL happened to be out of scope" (which still exits 0 with an
+# empty output file). Truncates <output-file> up front so a failed run
+# never leaves a stale prior result lying around to be picked up by mistake.
+bb_filter_scope_list() {
+    local input_file="$1" output_file="$2" line kept=0 dropped=0 rc=0
+
+    : > "$output_file"
+    [ -f "$input_file" ] || return 0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        if is_in_scope "$line"; then
+            printf '%s\n' "$line" >> "$output_file"
+            kept=$(( kept + 1 ))
+        else
+            rc=$?
+            [ "$rc" -eq 2 ] && return 2   # scope file itself is broken -- abort, don't half-filter
+            dropped=$(( dropped + 1 ))
+        fi
+    done < "$input_file"
+
+    _bb_audit_log "[SCOPE-FILTER] input=$input_file output=$output_file kept=$kept dropped=$dropped"
+    return 0
+}
+
+# ── Internal: required identifying User-Agent suffix ────────────────────────
+# Every outbound request this toolkit sends must be identifiable as coming
+# from a specific hacker. BBHUNT_USER_AGENT_SUFFIX is required, no default —
+# same fail-loud/fail-closed stance as is_in_scope() above, not "send it
+# unmarked and hope". Prints the combined "<base> <suffix>" User-Agent value
+# on success; prints nothing and returns non-zero if the suffix is unset,
+# blank, or contains a CR/LF (which would otherwise corrupt the header or
+# smuggle a second header into the request via `curl -H`).
+_bb_user_agent() {
+    local base="$1" suffix="${BBHUNT_USER_AGENT_SUFFIX:-}"
+    if [ -z "$suffix" ]; then
+        return 1
+    fi
+    case "$suffix" in
+        *$'\r'*|*$'\n'*) return 1 ;;
+    esac
+    printf '%s %s\n' "$base" "$suffix"
+}
+
 # ── Internal: rate limiting ──────────────────────────────────────────────────
 # Per-process minimum-interval enforcement via a global "last request" clock.
 # NOTE: this state is a plain shell variable, so it's only shared across
@@ -251,6 +325,13 @@ _bb_curl_impl() {
         return "$scope_rc"
     fi
 
+    local user_agent
+    if ! user_agent="$(_bb_user_agent "agentic-bug-hunter/bb_curl")"; then
+        echo "[bb_curl] FATAL — BBHUNT_USER_AGENT_SUFFIX is not set (or contains a CR/LF) — refusing to send an unmarked request. export BBHUNT_USER_AGENT_SUFFIX='yourhandle (+https://hackerone.com/yourhandle)'" >&2
+        _bb_audit_log "[FATAL-NO-USER-AGENT-SUFFIX] BBHUNT_USER_AGENT_SUFFIX unset or invalid, url=$url"
+        return 2
+    fi
+
     [ "$do_rate_limit" = "1" ] && _bb_rate_limit_wait
 
     local -a auth_args=()
@@ -270,9 +351,9 @@ _bb_curl_impl() {
         done <<< "$BBHUNT_AUTH_HEADERS"
     fi
 
-    _bb_audit_log "[REQUEST] url=$url"
+    _bb_audit_log "[REQUEST] url=$url ua=$user_agent"
 
-    curl "${auth_args[@]}" "$url" "$@"
+    curl -H "User-Agent: $user_agent" "${auth_args[@]}" "$url" "$@"
 }
 
 # ── bb_curl ───────────────────────────────────────────────────────────────────
