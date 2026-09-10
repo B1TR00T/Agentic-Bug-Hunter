@@ -49,6 +49,16 @@ def _is_blocked_redirect_target(hostname: str) -> bool:
     )
 
 
+def is_private_or_internal_host(hostname: str) -> bool:
+    """Public wrapper around the same private/loopback/link-local/reserved/
+    multicast/metadata-host classification the SSRF redirect-target guard
+    already uses internally (_is_blocked_redirect_target, unchanged, still
+    the sole implementation). Exposed for callers outside this module that
+    need the identical IP-range logic -- e.g. an SSRF scanner inspecting a
+    target's own redirect Location header -- without reimplementing it."""
+    return _is_blocked_redirect_target(hostname)
+
+
 # =============================================================================
 # Scope check, audit log, rate limit — ported from tools/bb_curl.sh so both
 # toolchains share one scope file, one audit log, and identical accept/reject
