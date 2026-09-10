@@ -190,7 +190,13 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None  # never auto-follow; safe_urlopen drives redirects itself
 
 
-def safe_urlopen(req: urllib.request.Request, timeout: float = 10, max_redirects: int = 5, **kwargs):
+def safe_urlopen(
+    req: urllib.request.Request,
+    timeout: float = 10,
+    max_redirects: int = 5,
+    follow_redirects: bool = True,
+    **kwargs,
+):
     """Like urllib.request.urlopen(req), but validates every redirect hop's
     hostname before following it, rejecting private/loopback/link-local/
     metadata addresses.
@@ -200,7 +206,26 @@ def safe_urlopen(req: urllib.request.Request, timeout: float = 10, max_redirects
     keep that behavior unchanged. context=<ssl.SSLContext> is handled
     specially by _one_hop: OpenerDirector.open() doesn't accept a
     context= kwarg the way module-level urlopen() does, so it's bound to
-    an HTTPSHandler on the opener instead of being forwarded as-is."""
+    an HTTPSHandler on the opener instead of being forwarded as-is.
+
+    follow_redirects=False (default True): fire exactly one request and
+    return its response as-is, 3xx included, without inspecting or
+    validating any Location header. This is a genuinely different mode,
+    not a weaker version of the default -- callers that need to observe a
+    server's raw redirect response (e.g. an open-redirect scanner reading
+    the Location header itself) need the single hop to actually complete
+    rather than being silently followed and hidden by this wrapper. Scope
+    check and rate limit still apply to that one request; the SSRF
+    redirect-target guard doesn't apply here because no redirect is ever
+    followed in this mode -- there's nothing for it to guard."""
+    if not follow_redirects:
+        if not is_in_scope(req.full_url):
+            raise urllib.error.URLError(
+                f"blocked out of scope (BBHUNT_SCOPE_FILE guard): {req.full_url!r}"
+            )
+        _rate_limit_wait()
+        return _one_hop(req, timeout, **kwargs)
+
     current = req
     for _ in range(max_redirects + 1):
         if not is_in_scope(current.full_url):
