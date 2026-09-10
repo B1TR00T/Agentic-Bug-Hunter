@@ -670,6 +670,90 @@ def run_cors_scan(domain):
     return True
 
 
+def _openredirect_finding_to_line(finding):
+    """Translate one openredirect_scanner.py --json finding dict into the
+    "[TAG] [SUBCAT] url ..." line convention, same rationale as
+    _cors_finding_to_line(). Every finding this scanner ever produces is,
+    by its own design, a directly-confirmed reflection (Location literally
+    contains the test domain) -- there's no "possible"/"maybe" tier the
+    way cors_scanner.py or vuln_scanner.sh's SQLi probes have, so the
+    confidence tag is unconditionally CONFIRMED, not a mapping table.
+    """
+    param = finding.get("param", "")
+    subcat = "OPENREDIRECT-CONFIRMED"
+    url = finding.get("url", "")
+    payload = finding.get("payload", "")
+    location = finding.get("location", "")
+    note = finding.get("note", "")
+    line = f"[CONFIRMED] [{subcat}] {url} | param={param} payload={payload} location={location}"
+    if note:
+        line += f" note={note}"
+    return line
+
+
+def run_openredirect_scan(domain):
+    """Run openredirect_scanner.py against this target's parameterized
+    URLs and translate its JSON findings into vuln_scanner.sh's
+    [TAG] [SUBCAT] url line convention, written to
+    findings/<domain>/openredirect/findings.txt.
+
+    Same design as run_cors_scan(): translation lives here, not as a JSON-
+    input path inside findings_correlator.py, for the identical reasoning
+    (per-tool JSON shape/vocabulary, correlator stays a dumb aggregator).
+    Raw JSON is preserved alongside the translated lines for full-fidelity
+    review. Best-effort only -- a bug here must not take down the rest of
+    hunt_target()'s output.
+
+    Reads urls/with_params.txt, not live/urls.txt: openredirect_scanner.py
+    only ever acts on query-string parameters, so it needs the
+    parameterized URL list recon_engine.sh already collects (the same
+    file vuln_scanner.sh's SQLi/SSTI checks read), not the bare live-host
+    list cors_scanner.py uses.
+    """
+    params_urls = os.path.join(RECON_DIR, domain, "urls", "with_params.txt")
+    if not os.path.isfile(params_urls) or os.path.getsize(params_urls) == 0:
+        return False
+
+    script = os.path.join(TOOLS_DIR, "openredirect_scanner.py")
+    if not os.path.isfile(script):
+        log("warn", "openredirect_scanner.py missing — skipping open-redirect scan")
+        return False
+
+    try:
+        # Same reasoning as run_cors_scan(): the script's own exit code
+        # (0 clean / 2 findings) is a grep-style convention, not an error
+        # signal -- whether stdout parses as JSON is what matters here.
+        _ok, output = run_cmd(
+            f'python3 "{script}" -l "{params_urls}" --json',
+            cwd=BASE_DIR, timeout=600,
+        )
+        redirect_findings = json.loads(output)
+    except Exception as e:  # noqa: BLE001 -- see run_findings_correlator()
+        log("warn", f"openredirect_scanner.py failed for {domain}: {type(e).__name__}: {e}")
+        return False
+
+    findings_dir = os.path.join(FINDINGS_DIR, domain, "openredirect")
+    os.makedirs(findings_dir, exist_ok=True)
+
+    try:
+        with open(os.path.join(findings_dir, "openredirect_scanner_raw.json"), "w", encoding="utf-8") as fh:
+            json.dump(redirect_findings, fh, indent=2)
+    except OSError:
+        pass
+
+    lines_path = os.path.join(findings_dir, "findings.txt")
+    try:
+        with open(lines_path, "w", encoding="utf-8") as fh:
+            for finding in redirect_findings:
+                fh.write(_openredirect_finding_to_line(finding) + "\n")
+    except OSError as e:
+        log("warn", f"Could not write {lines_path}: {type(e).__name__}: {e}")
+        return False
+
+    log("ok", f"Open redirect scan: {len(redirect_findings)} finding(s) for {domain} — see {lines_path}")
+    return True
+
+
 def run_findings_correlator(domain):
     """Run findings_correlator.py against this target's findings dir and
     print a short "go look at this" summary line -- the same "don't let
@@ -905,6 +989,10 @@ def hunt_target(
     # CORS misconfiguration scan against this target's live URLs.
     # Best-effort/non-fatal by design -- see run_cors_scan().
     run_cors_scan(domain)
+
+    # Open redirect scan against this target's parameterized URLs.
+    # Best-effort/non-fatal by design -- see run_openredirect_scan().
+    run_openredirect_scan(domain)
 
     # CVE hunting (only when explicitly requested)
     if cve_hunt:
