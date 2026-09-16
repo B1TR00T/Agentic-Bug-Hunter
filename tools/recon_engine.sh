@@ -2,7 +2,25 @@
 # =============================================================================
 # Enhanced Recon Engine
 # Full reconnaissance pipeline for bug bounty targets
-# Usage: ./recon_engine.sh <target-domain> [--quick]
+# Usage: ./recon_engine.sh <target-domain> [--quick] [--shodan] [--cve-check]
+#
+# --shodan is opt-in and OFF by default (same pattern as hunt.py's
+# --graphql/--cve-hunt flags: an explicit flag gates an entire optional
+# module, nothing about it runs unless asked). When passed, it requires
+# SHODAN_API_KEY to be set (checked up front, before Phase 1 starts) and
+# runs tools/shodan_recon.py against $TARGET using the same BBHUNT_SCOPE_FILE
+# already required for this whole script; its scope-checked hosts.txt output
+# is merged into subdomains/ so it flows through the existing Phase 1 merge
+# and every later phase (httpx, katana, etc.) picks it up automatically.
+#
+# --cve-check is opt-in and OFF by default, same reasoning as --shodan: it
+# hits NVD's external, rate-limited API (tools/cve_lookup.py), so nothing
+# about it runs unless asked. Unlike SHODAN_API_KEY, NVD_API_KEY is genuinely
+# OPTIONAL, not required -- if unset, cve_lookup.py itself proceeds at NVD's
+# unauthenticated rate (5 req/30s) rather than refusing to run; if set, it's
+# picked up automatically since it's just an inherited environment variable,
+# no extra plumbing needed here. Runs as Phase 2.6, right after Phase 2.5
+# (Tech Fingerprinting) completes, feeding it that phase's raw.json.
 # =============================================================================
 
 set -o pipefail
@@ -21,9 +39,21 @@ log_step()  { echo -e "    ${CYAN}[>]${NC} $1"; }
 log_done()  { echo -e "    ${GREEN}[✓]${NC} $1"; }
 log_vuln()  { echo -e "    ${RED}[VULN]${NC} $1"; }
 
-TARGET="${1:?Usage: $0 <target> [--quick]  (target = FQDN, IP, CIDR, or path to a file of domains/hosts)}"
+TARGET="${1:?Usage: $0 <target> [--quick] [--shodan] [--cve-check]  (target = FQDN, IP, CIDR, or path to a file of domains/hosts)}"
 QUICK_MODE="${2:-}"
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# --shodan/--cve-check can appear in any position (alongside/instead of
+# --quick), unlike QUICK_MODE's fixed $2 slot -- scanned for explicitly
+# rather than folded into the positional args so adding either never
+# disturbs the existing $1/$2 contract callers (including hunt.py) already
+# rely on.
+SHODAN_MODE=0
+CVE_CHECK_MODE=0
+for _arg in "$@"; do
+    [ "$_arg" = "--shodan" ] && SHODAN_MODE=1
+    [ "$_arg" = "--cve-check" ] && CVE_CHECK_MODE=1
+done
 
 # Auth-aware hunting: load BBHUNT_AUTH_HEADERS / BBHUNT_SESSION_ID into
 # BB_AUTH_ARGS=(-H 'Name: val' ...). Empty session = no-op.
@@ -53,6 +83,47 @@ if [ -z "${BBHUNT_SCOPE_FILE:-}" ] || [ ! -f "${BBHUNT_SCOPE_FILE:-/nonexistent}
     exit 1
 fi
 
+# Every outbound request this pipeline sends must be identifiable as coming
+# from a specific hacker — same fail-loud/fail-closed requirement as the
+# scope-file check above, and checked just as early, before Phase 1, so the
+# whole run refuses rather than partially executing unattributed.
+#
+# _bb_user_agent() (from bb_curl.sh, sourced above) is reused here rather
+# than reimplemented — same unset/blank/CR-LF validation, same base string
+# convention as bb_curl()'s own "agentic-bug-hunter/bb_curl <suffix>".
+# RECON_USER_AGENT is then wired into every httpx/katana/ffuf/nuclei
+# invocation below via -H "User-Agent: ...".
+#
+# This gate still blocks the ENTIRE run — including subfinder, amass, gau,
+# and nmap — even though none of those four have any flag to carry a custom
+# User-Agent/header at all (checked against each tool's own --help output;
+# see the comment at each of their invocations below for specifics). The
+# alternative — silently letting the unattributable tools run while only
+# the attributable ones get marked — would defeat the point: a program that
+# requires every request to be identifiable shouldn't get some of a
+# hacker's recon traffic for free just because the tool that sent it has no
+# header to set.
+if ! RECON_USER_AGENT="$(_bb_user_agent "agentic-bug-hunter/recon")"; then
+    log_err "BBHUNT_USER_AGENT_SUFFIX is not set (or contains a CR/LF) — refusing to run."
+    log_err "Every outbound request this pipeline sends must be identifiable as coming"
+    log_err "from a specific hacker. Set it and re-run, e.g.:"
+    log_err "  export BBHUNT_USER_AGENT_SUFFIX='yourhandle (+https://hackerone.com/yourhandle)'"
+    exit 1
+fi
+
+# Shodan step (--shodan) is opt-in and off by default -- but if it WAS
+# requested, its prerequisite is checked here, before anything else in the
+# run starts, same fail-loud/fail-closed posture as the two gates just
+# above: a missing SHODAN_API_KEY should abort before Phase 1 even begins,
+# not surface as a confusing failure inside shodan_recon.py after
+# subfinder/amass/crt.sh/wayback have already spent several minutes.
+if [ "$SHODAN_MODE" = "1" ] && [ -z "${SHODAN_API_KEY:-}" ]; then
+    log_err "SHODAN_API_KEY is not set, but --shodan was passed — refusing to run."
+    log_err "Get a key at https://account.shodan.io and export it:"
+    log_err "  export SHODAN_API_KEY='yourkeyhere'"
+    exit 1
+fi
+
 # Domain-list mode: if the target is a readable regular file, treat its
 # contents as a pre-resolved scope list (one host per line, # comments OK).
 # Useful for programs without wildcards where subdomain enum is wasted work.
@@ -74,7 +145,7 @@ RATE_LIMIT="${BB_RATE_LIMIT:-150}"  # requests per second
 print_banner "Recon Engine · Bug Bounty" "$TARGET" \
     "Subdomain enum|subfinder · amass · crt.sh · wayback" \
     "Live probe|httpx + dnsx with tech fingerprinting" \
-    "URL crawl|katana · gau · waybackurls" \
+    "URL crawl|gau · waybackurls (passive archives only -- katana removed, see Phase 4)" \
     "Templates|nuclei sweep (optional)"
 
 # Prefer Go tools in ~/go/bin
@@ -172,6 +243,8 @@ echo "============================================="
 echo "  Recon Engine — $TARGET"
 echo "  Output: $RECON_DIR/"
 echo "  Mode: $([ "$QUICK_MODE" = "--quick" ] && echo "Quick" || echo "Full")"
+echo "  Shodan: $([ "$SHODAN_MODE" = "1" ] && echo "Enabled (--shodan)" || echo "Disabled (default)")"
+echo "  CVE check: $([ "$CVE_CHECK_MODE" = "1" ] && echo "Enabled (--cve-check)" || echo "Disabled (default)")"
 echo "  Time: $(date)"
 bb_auth_active && bb_auth_banner
 echo "============================================="
@@ -236,6 +309,10 @@ if [ "$TARGET_TYPE" = "list" ]; then
 elif [ "$TARGET_TYPE" = "cidr" ]; then
     log_info "CIDR target — running nmap ping sweep to discover live hosts"
     if command -v nmap &>/dev/null; then
+        # No -H/--user-agent equivalent: nmap operates at the packet level
+        # (ICMP/TCP/UDP), not HTTP, so there is no header field to carry an
+        # identifying string. See the note at the Phase 3 -sV invocation
+        # below for the full explanation of why this isn't just an oversight.
         nmap -sn "$TARGET" -oG - 2>/dev/null \
             | awk '/Up$/{print $2}' \
             > "$RECON_DIR/subdomains/all.txt" || true
@@ -256,6 +333,14 @@ elif [ "${SCOPE_LOCK:-0}" = "1" ] && [ "$TARGET_TYPE" = "ip" ]; then
 else
 
 # Subfinder (passive, fast)
+# No -H/-ua/User-Agent flag exists anywhere in `subfinder -h` — checked
+# directly against its own help output, not assumed. Also, unlike
+# httpx/katana/ffuf/nuclei, subfinder in passive mode never talks to the
+# TARGET at all: it queries third-party OSINT sources (crt.sh, VirusTotal,
+# SecurityTrails, etc. — see `subfinder -ls`) about the target. The
+# attribution gap here is real (subfinder still can't be marked as coming
+# from a specific hacker) but it's a different kind of gap than an
+# unattributed request landing on the target's own infrastructure.
 if command -v subfinder &>/dev/null; then
     log_step "Running subfinder..."
     subfinder -d "$TARGET" -silent -all -t 50 -o "$RECON_DIR/subdomains/subfinder.txt" 2>/dev/null || true
@@ -265,6 +350,9 @@ else
 fi
 
 # Amass (passive)
+# Same story as subfinder immediately above: `amass enum -h` has no
+# User-Agent/header flag, and -passive mode queries third-party sources
+# rather than the target directly.
 if command -v amass &>/dev/null && [ "$QUICK_MODE" != "--quick" ]; then
     log_step "Running amass (passive, 5min timeout)..."
     timeout 300 amass enum -passive -d "$TARGET" -o "$RECON_DIR/subdomains/amass.txt" 2>/dev/null || true
@@ -303,6 +391,29 @@ curl -s "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=o
     | sort -u > "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || true
 log_done "wayback: $(wc -l < "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || echo 0) subdomains"
 
+# Shodan passive recon (opt-in via --shodan, off by default -- see the
+# SHODAN_API_KEY gate near the top of this script). Every host in its
+# hosts.txt output already passed tools.safe_http.is_in_scope() inside
+# shodan_recon.py itself before being written there -- nothing further to
+# scope-check here. Copying that file into subdomains/ (rather than
+# writing a second, separate merge step) means it flows through the exact
+# same "cat subdomains/*.txt | sort -u > all.txt" merge every other source
+# above already uses, so every later phase (httpx, katana, gau, etc.)
+# consumes it identically without any extra wiring anywhere else.
+# Best-effort/non-fatal by design (same posture as hunt.py's
+# run_cors_scan()/run_openredirect_scan()): a Shodan failure here should
+# never take down the rest of the recon run.
+if [ "$SHODAN_MODE" = "1" ]; then
+    log_step "Running Shodan passive recon (hostname: search, scope-checked per-host)..."
+    SHODAN_RECON_ROOT="$(dirname "$RECON_DIR")"
+    python3 "$(dirname "$0")/shodan_recon.py" "$TARGET" --recon-root "$SHODAN_RECON_ROOT" \
+        || log_warn "shodan_recon.py failed or found nothing -- continuing without it"
+    if [ -s "$RECON_DIR/shodan/hosts.txt" ]; then
+        cp "$RECON_DIR/shodan/hosts.txt" "$RECON_DIR/subdomains/shodan_hosts.txt"
+        log_done "Shodan: $(wc -l < "$RECON_DIR/shodan/hosts.txt") in-scope host(s) merged into subdomains/"
+    fi
+fi
+
 # Merge and deduplicate all subdomains
 cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/subdomains/all.txt"
 TOTAL_SUBS=$(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)
@@ -318,6 +429,10 @@ log_info "Phase 2: HTTP Probing"
 
 if [ -x "$HTTPX_BIN" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
     log_step "Probing with httpx (status, title, tech, content-length)..."
+    # -random-agent defaults to true in httpx (i.e. it picks a random UA
+    # per request unless told otherwise) -- that's the opposite of
+    # attribution, so it's explicitly disabled here rather than left to
+    # fight with the -H override below.
     "$HTTPX_BIN" -l "$RECON_DIR/subdomains/all.txt" \
         -silent \
         -status-code \
@@ -325,6 +440,8 @@ if [ -x "$HTTPX_BIN" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
         -tech-detect \
         -content-length \
         -follow-redirects \
+        -random-agent=false \
+        -H "User-Agent: $RECON_USER_AGENT" \
         -threads "$THREADS" \
         -rate-limit "$RATE_LIMIT" \
         ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
@@ -351,6 +468,229 @@ else
 fi
 
 # ============================================================
+# Phase 2.5: Tech Fingerprinting (always-on -- same risk/cost profile as
+# the httpx/nuclei phases in this pipeline; no flag gates this)
+# ============================================================
+echo ""
+log_info "Phase 2.5: Tech Fingerprinting"
+
+FINGERPRINT_DIR="$RECON_DIR/fingerprint"
+FINGERPRINT_FINDINGS_DIR="$BASE_DIR/findings/$TARGET/fingerprint"
+mkdir -p "$FINGERPRINT_DIR"
+
+FP_TARGETS="$RECON_DIR/live/fingerprint_targets.txt"
+: > "$FP_TARGETS"
+if [ -s "$RECON_DIR/live/httpx_full.txt" ]; then
+    # Basic-connectivity filter: httpx already recorded a status code for
+    # every host in this file, including dead-on-arrival 404s -- don't
+    # waste tech_fingerprint.py's several-request-per-host probe budget
+    # re-confirming a host we already know 404s at the root. Hosts httpx
+    # couldn't connect to at all never made it into this file to begin
+    # with, so no separate connection-error filter is needed on top.
+    grep -v '\[404\]' "$RECON_DIR/live/httpx_full.txt" | awk '{print $1}' | sort -u > "$FP_TARGETS" 2>/dev/null || true
+elif [ -s "$RECON_DIR/live/urls.txt" ]; then
+    sort -u "$RECON_DIR/live/urls.txt" > "$FP_TARGETS" 2>/dev/null || true
+fi
+
+TECH_FINGERPRINT_SCRIPT="$(dirname "$0")/tech_fingerprint.py"
+if [ ! -s "$FP_TARGETS" ]; then
+    log_warn "No live hosts (or all 404 at root) — skipping tech fingerprinting"
+elif [ ! -f "$TECH_FINGERPRINT_SCRIPT" ]; then
+    log_warn "tech_fingerprint.py missing — skipping tech fingerprinting"
+else
+    N_FP_TARGETS=$(wc -l < "$FP_TARGETS" | tr -d ' ')
+    log_step "Fingerprinting $N_FP_TARGETS live host(s) (Jira/Confluence/Sentry/Jenkins/GitLab/Grafana/Kibana/FleetDM/Cachix)..."
+
+    # Best-effort/non-fatal, same posture as hunt.py's
+    # run_findings_correlator(): a missing script, non-zero exit, timeout,
+    # or malformed JSON here must not take down the rest of this recon
+    # run. Everything runs in a subshell with its own `set -e` so any of
+    # those failure modes short-circuits straight past the write step
+    # instead of writing partial/bogus output -- the parent script (no
+    # `set -e` of its own) is completely unaffected by the subshell's exit
+    # status either way, same as every other best-effort block above.
+    (
+        set -e
+        # tech_fingerprint.py's exit code follows cors_scanner.py's
+        # grep-style pipeline convention: 1 means "ran fine, nothing
+        # identified", not a crash -- the `|| true` here stops `set -e`
+        # from treating that common, legitimate outcome as a failure. A
+        # REAL crash still gets caught below: it leaves raw.json
+        # empty/unparseable, and json.load on that raises -- still inside
+        # `set -e` -- which is what actually aborts this subshell.
+        timeout 600 python3 "$TECH_FINGERPRINT_SCRIPT" -l "$FP_TARGETS" --json \
+            > "$FINGERPRINT_DIR/raw.json" || true
+
+        python3 - "$FINGERPRINT_DIR/raw.json" "$FINGERPRINT_DIR/results.txt" "$FINGERPRINT_FINDINGS_DIR/results.txt" <<'PY'
+import json
+import os
+import sys
+
+raw_path, recon_out, findings_out = sys.argv[1:4]
+with open(raw_path, encoding="utf-8") as fh:
+    results = json.load(fh)
+
+# Only identified products get a line -- an "unidentified" host isn't an
+# informational finding, it's a non-result, same reasoning as why other
+# phases in this script only write positive hits (e.g. exposure/config_files.txt).
+lines = []
+for r in results:
+    product = r.get("product") or "unidentified"
+    if product == "unidentified":
+        continue
+    version = r.get("version") or "not disclosed"
+    confidence = r.get("confidence") or "none"
+    url = r.get("url", "")
+    lines.append(f"[INFORMATIONAL] [{product}] {url} — version: {version} — confidence: {confidence}")
+
+text = ("\n".join(lines) + "\n") if lines else ""
+# Written to BOTH recon/<target>/fingerprint/ (this phase's own output)
+# and findings/<target>/fingerprint/ (so findings_correlator.py -- which
+# only ever reads from findings/<target>/<category>/*.txt -- can group a
+# fingerprinted product together with any other finding on the same host).
+for out_path in (recon_out, findings_out):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+print(len(lines))
+PY
+    ) > "$FINGERPRINT_DIR/count.txt" 2> "$FINGERPRINT_DIR/stderr.log"
+    FP_STATUS=$?
+
+    if [ "$FP_STATUS" -eq 0 ] && [ -s "$FINGERPRINT_DIR/count.txt" ]; then
+        FP_COUNT="$(tail -1 "$FINGERPRINT_DIR/count.txt" | tr -dc '0-9')"
+        if [ -n "$FP_COUNT" ] && [ "$FP_COUNT" -gt 0 ] 2>/dev/null; then
+            log_done "Tech fingerprinting: $FP_COUNT product(s) identified — see $FINGERPRINT_DIR/results.txt"
+        else
+            log_done "Tech fingerprinting: no known products identified"
+        fi
+    else
+        log_warn "Tech fingerprinting failed (see $FINGERPRINT_DIR/stderr.log) — continuing without it"
+    fi
+fi
+
+# ============================================================
+# Phase 2.6: CVE Lookup (opt-in via --cve-check, OFF by default -- hits
+# NVD's external, rate-limited API; see the --cve-check note at the top
+# of this file)
+# ============================================================
+if [ "$CVE_CHECK_MODE" = "1" ]; then
+    echo ""
+    log_info "Phase 2.6: CVE Lookup (--cve-check)"
+
+    CVE_DIR="$RECON_DIR/cve"
+    CVE_FINDINGS_DIR="$BASE_DIR/findings/$TARGET/cve"
+    mkdir -p "$CVE_DIR"
+
+    CVE_LOOKUP_SCRIPT="$(dirname "$0")/cve_lookup.py"
+    FINGERPRINT_RAW="$RECON_DIR/fingerprint/raw.json"
+
+    # NVD_API_KEY is genuinely OPTIONAL (unlike BBHUNT_SCOPE_FILE /
+    # BBHUNT_USER_AGENT_SUFFIX's hard fail-closed gates above) -- this is
+    # informational only, never a refusal. cve_lookup.py reads the env var
+    # itself at request time and picks the matching rate automatically; no
+    # extra plumbing is needed here since it's already inherited from this
+    # shell's environment into the python3 subprocess below.
+    if [ -z "${NVD_API_KEY:-}" ]; then
+        log_step "NVD_API_KEY not set — proceeding at NVD's unauthenticated rate (5 req/30s). Optional: https://nvd.nist.gov/developers/request-an-api-key for 50 req/30s."
+    else
+        log_step "NVD_API_KEY set — using NVD's authenticated rate (50 req/30s)."
+    fi
+
+    if [ ! -s "$FINGERPRINT_RAW" ]; then
+        log_warn "No tech-fingerprint data ($FINGERPRINT_RAW missing/empty) — skipping CVE lookup"
+    elif [ ! -f "$CVE_LOOKUP_SCRIPT" ]; then
+        log_warn "cve_lookup.py missing — skipping CVE lookup"
+    else
+        # Best-effort/non-fatal, same posture as Phase 2.5 above and
+        # hunt.py's run_findings_correlator(): a missing script, non-zero
+        # exit, timeout, or malformed JSON here must not take down the
+        # rest of this recon run. Same `set -e` subshell + JSON-validity-
+        # is-the-real-gate structure as Phase 2.5 -- see the comments
+        # there for the full reasoning, not repeated here.
+        (
+            set -e
+            # cve_lookup.py's exit code convention: 2 means "ran fine,
+            # candidate CVEs found", 0 means "ran fine, none found" --
+            # neither is a crash, so `|| true` stops `set -e` from
+            # treating either as a failure. A REAL crash leaves
+            # cve_raw.json empty/unparseable, and json.load on that
+            # raises -- still inside `set -e` -- which is what actually
+            # aborts this subshell.
+            timeout 900 python3 "$CVE_LOOKUP_SCRIPT" --from-fingerprint "$FINGERPRINT_RAW" --json \
+                > "$CVE_DIR/cve_raw.json" || true
+
+            python3 - "$FINGERPRINT_RAW" "$CVE_DIR/cve_raw.json" "$CVE_DIR/results.txt" "$CVE_FINDINGS_DIR/results.txt" <<'PY'
+import json
+import os
+import sys
+
+fp_path, cve_path, recon_out, findings_out = sys.argv[1:5]
+
+with open(fp_path, encoding="utf-8") as fh:
+    fingerprints = json.load(fh)
+with open(cve_path, encoding="utf-8") as fh:
+    cve_results = json.load(fh)
+
+# cve_lookup.py's --json output is keyed by (product, version), not by
+# host -- multiple fingerprinted hosts can share the same product+version
+# and must each get their own line here, so this cross-joins
+# tech_fingerprint.py's url -> (product, version) mapping against
+# cve_lookup.py's product/version -> CVE data.
+cve_by_key = {(r["product"], r["version"]): r for r in cve_results}
+
+lines = []
+for fp in fingerprints:
+    product = fp.get("product") or "unidentified"
+    version = fp.get("version") or "not disclosed"
+    if product == "unidentified" or version == "not disclosed":
+        continue
+    result = cve_by_key.get((product, version))
+    if not result:
+        continue
+    url = fp.get("url", "")
+    for cve in result.get("cves", []):
+        severity = cve.get("severity")
+        score = cve.get("cvss_score")
+        sev_str = f"{severity} ({score})" if severity else "no CVSS score on record"
+        match_tag = "version-mentioned" if cve.get("version_mentioned") else "product-match-only"
+        # [INFORMATIONAL], never [CONFIRMED] -- every candidate here
+        # requires manual verification, per cve_lookup.py's own framing.
+        lines.append(
+            f"[INFORMATIONAL] [{cve.get('cve_id', '?')}] {url} "
+            f"— product={product} version={version} severity={sev_str} match={match_tag} "
+            f"— {cve.get('summary', '')} — {result.get('note', '')}"
+        )
+
+text = ("\n".join(lines) + "\n") if lines else ""
+# Written to BOTH recon/<target>/cve/ (this phase's own output) and
+# findings/<target>/cve/ (so findings_correlator.py -- which only ever
+# reads from findings/<target>/<category>/*.txt -- can group a candidate
+# CVE together with any other finding on the same host), same dual-write
+# pattern as Phase 2.5's fingerprint output.
+for out_path in (recon_out, findings_out):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+print(len(lines))
+PY
+        ) > "$CVE_DIR/count.txt" 2> "$CVE_DIR/stderr.log"
+        CVE_STATUS=$?
+
+        if [ "$CVE_STATUS" -eq 0 ] && [ -s "$CVE_DIR/count.txt" ]; then
+            CVE_COUNT="$(tail -1 "$CVE_DIR/count.txt" | tr -dc '0-9')"
+            if [ -n "$CVE_COUNT" ] && [ "$CVE_COUNT" -gt 0 ] 2>/dev/null; then
+                log_done "CVE lookup: $CVE_COUNT candidate CVE(s) — see $CVE_DIR/results.txt"
+            else
+                log_done "CVE lookup: no candidate CVEs found"
+            fi
+        else
+            log_warn "CVE lookup failed (see $CVE_DIR/stderr.log) — continuing without it"
+        fi
+    fi
+fi
+
+# ============================================================
 # Phase 3: Port Scanning
 # ============================================================
 echo ""
@@ -358,6 +698,23 @@ log_info "Phase 3: Port Scanning"
 
 if command -v nmap &>/dev/null; then
     log_step "Running nmap (top 1000 ports) on $TARGET..."
+    # No User-Agent equivalent here, and this is not an oversight to fix
+    # later -- a TCP/SYN port scan has no application-layer field to carry
+    # an identifying string in at all. -sV's service/version detection does
+    # send a handful of fixed protocol probes (nmap-service-probes), and
+    # one of the built-in HTTP probes is a literal "GET / HTTP/1.0\r\n\r\n"
+    # -- but nmap has no flag to inject a custom header into that probe,
+    # and doing so would corrupt the exact byte-for-byte signature its
+    # service-fingerprint matching relies on. NSE's http.useragent script
+    # argument is a different thing entirely -- it only affects HTTP
+    # requests made BY NSE scripts (e.g. --script http-title), and this
+    # invocation runs no NSE scripts at all, so it wouldn't apply here
+    # even if it were added.
+    #
+    # What actually identifies a scan at this layer is the source IP (and,
+    # to a fingerprinting target, nmap's own packet/timing signature) --
+    # not an injectable marker. That's a real, structural difference from
+    # HTTP-based tools, not a gap this script can close by trying harder.
     nmap -sV --top-ports 1000 -T4 --open "$TARGET" \
         -oN "$RECON_DIR/ports/nmap_results.txt" \
         -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
@@ -379,6 +736,9 @@ echo ""
 log_info "Phase 4: URL Collection"
 
 # GAU - Get All URLs (wayback, commoncrawl, otx, urlscan)
+# `gau -h` has no User-Agent/header flag either. Same nature as
+# subfinder/amass above: gau queries wayback/commoncrawl/otx/urlscan about
+# the target, it doesn't send requests to the target's own infrastructure.
 if command -v gau &>/dev/null; then
     log_step "Running gau (historical URLs)..."
     echo "$TARGET" | gau --threads 20 --o "$RECON_DIR/urls/gau.txt" 2>/dev/null || \
@@ -391,19 +751,36 @@ else
     log_done "wayback: $(wc -l < "$RECON_DIR/urls/wayback.txt" 2>/dev/null || echo 0) URLs"
 fi
 
-# katana — active crawl on live hosts (5 min cap prevents infinite crawl on
-# content-heavy sites like news/video portals)
-if command -v katana &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
-    log_step "Running katana (active crawl, 5min cap, top 50 hosts)..."
-    head -50 "$RECON_DIR/live/urls.txt" > "$RECON_DIR/urls/katana_targets.txt"
-    timeout 300 katana \
-        -list "$RECON_DIR/urls/katana_targets.txt" \
-        -d 3 -jc -kf all -silent \
-        -c 50 -p 20 \
-        ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
-        -o "$RECON_DIR/urls/katana.txt" 2>/dev/null || true
-    log_done "katana: $(wc -l < "$RECON_DIR/urls/katana.txt" 2>/dev/null || echo 0) URLs"
-fi
+# katana (active crawl) was removed from this pipeline entirely -- not
+# disabled, not gated behind a flag, gone. Three consecutive attempts to
+# make its crawl scope trustworthy against a real target all failed:
+#   1. -cs (crawl-scope allow-regex) alone: leaked 4 URLs to
+#      shop.vodafone.om/careers.vodafone.om/numbers.vodafone.om.
+#   2. -cs + -dr (disable-redirects): leaked the SAME 4 URLs, identically
+#      -- despite -dr passing ~20/20 local trials against a synthetic
+#      same-host-redirector harness. Whatever mechanism causes the real
+#      leak isn't a followed redirect at all.
+#   3. -cs + -proxy (a local scope-enforcing forward proxy -- see
+#      tools/scope_proxy.py, kept in the repo as a standalone reusable
+#      tool even though it's no longer wired in here): closed every
+#      leak vector tested EXCEPT redirect-following, which bypasses
+#      katana's own -proxy setting entirely and connects directly. Adding
+#      -dr back to plug that specific hole made katana hang for the
+#      FULL 300s timeout on every single run (4/4 trials, including one
+#      at the actual 300s production ceiling) -- -dr and -proxy are
+#      mutually incompatible in this katana version, not just flaky
+#      together.
+# Every one of katana's own scope mechanisms either doesn't get consulted
+# by every internal subsystem, or breaks something else when combined
+# with the fix for that. gau (below) is passive-archive-only -- it never
+# touches the live target at all, so it has no equivalent scope risk; it
+# is now the sole URL-collection source for this phase. The tradeoff is
+# real: katana was finding genuine value gau doesn't have (live API
+# endpoints not yet in any archive), and losing it is a real completeness
+# cost, not a free win -- accepted deliberately because guessing at
+# katana flags against a live target has cost two real, if now small,
+# scope violations and does not currently converge on a fix that also
+# keeps katana usable.
 
 # Merge all collected URLs
 cat "$RECON_DIR/urls/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/urls/all.txt" 2>/dev/null || true
@@ -503,6 +880,7 @@ if command -v ffuf &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
                 -rate "$RATE_LIMIT" \
                 -sf \
                 -timeout 10 \
+                -H "User-Agent: $RECON_USER_AGENT" \
                 ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
                 -o "$RECON_DIR/dirs/ffuf_${domain}.json" \
                 -of json 2>/dev/null || true
@@ -543,8 +921,30 @@ if [ -s "$RECON_DIR/live/urls.txt" ]; then
     : > "$RECON_DIR/exposure/config_files.txt"
 
     while IFS= read -r base_url; do
+        # Catch-all guard: a host that answers every path the same way --
+        # a client-routed SPA shell, or a backend API that ignores the
+        # requested path entirely -- defeats the content-type check below
+        # on its own. Confirmed live: a PKI/CA host returned
+        # `Content-Type: application/json` for every single CONFIG_PATHS
+        # entry (a catch-all API always answering with the same cert-chain
+        # JSON regardless of path), which passed the content-type filter
+        # and got flagged as 11 separate "exposed config files" that were
+        # never real. bb_catchall_baseline()/bb_response_signature()
+        # (tools/bb_curl.sh) catch this class regardless of which
+        # status/content-type the shared answer happens to have, by
+        # comparing each probed path against a deliberately nonexistent
+        # one instead of trusting content-type alone -- checked per PATH,
+        # not as a single blanket per-host skip (a host with no index page
+        # at "/" would otherwise look identical to a real catch-all).
+        # Uses bb_curl (with auth), not the default bb_curl_no_auth, to
+        # match how this phase's own probes below are already sent --
+        # an unauthenticated baseline compared against authenticated
+        # probe results would be comparing two different things.
+        BASELINE="$(bb_catchall_baseline "$base_url" bb_curl)"
         for path in "${CONFIG_PATHS[@]}"; do
-            STATUS=$(bb_curl "${base_url}${path}" -s -o /dev/null -w "%{http_code}" --max-time 5 2>/dev/null || echo "000")
+            SIG="$(bb_response_signature "${base_url}${path}" bb_curl)"
+            [ "$SIG" = "$BASELINE" ] && continue
+            STATUS="${SIG%%:*}"
             if [ "$STATUS" = "200" ]; then
                 CONTENT_TYPE=$(bb_curl "${base_url}${path}" -sI --max-time 5 2>/dev/null | grep -i content-type | head -1)
                 # Only flag if it returns JS/JSON/text (not HTML error pages)
@@ -650,6 +1050,7 @@ if command -v nuclei &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
         -bs "$NUC_BS" \
         -silent \
         -stats \
+        -H "User-Agent: $RECON_USER_AGENT" \
         ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
         -jsonl \
         -o "$NUCLEI_OUT/findings.jsonl" 2>/dev/null || true

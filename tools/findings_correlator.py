@@ -30,6 +30,17 @@ not assumed):
                        findings/<target>/metasploit/*.rc resource scripts -- no [TAG]-format
                        .txt output at all. Included in CATEGORIES below for forward
                        compatibility (harmless no-op glob) but will never produce findings today.
+  - fingerprint/results.txt : "[TAG] [PRODUCT] <url> — version: X — confidence: Y" (URL
+                       positional after tags, like upload). Written by tools/recon_engine.sh's
+                       always-on tech-fingerprinting phase (tools/tech_fingerprint.py) into
+                       BOTH recon/<target>/fingerprint/ (that phase's own output) and here --
+                       this directory is the copy this correlator actually reads.
+  - cve/results.txt  : "[TAG] [CVE-ID] <url> — product=X version=Y severity=... match=... —
+                       <summary> — <note>" (URL positional after tags, like fingerprint).
+                       Written by tools/recon_engine.sh's opt-in --cve-check phase
+                       (tools/cve_lookup.py) into BOTH recon/<target>/cve/ and here, same
+                       dual-write pattern as fingerprint/ above. Always [INFORMATIONAL] --
+                       cve_lookup.py's own framing is candidate-only, never confirmed.
   - sqli/nuclei_sqli.txt and saml/certs.txt sit inside these directories but hold raw
     nuclei JSONL / raw X509 cert text respectively -- not [TAG]-format lines. Lines that
     don't start with a known confidence tag are silently skipped and counted, not misparsed.
@@ -56,7 +67,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Directory names under findings/<target>/ that vuln_scanner.sh's checks
 # write [TAG]-format lines into. "cms" is listed for forward compatibility
 # even though no such directory exists today -- see module docstring.
-CATEGORIES = ["upload", "sqli", "ssti", "cms", "mfa", "saml", "cors", "openredirect"]
+CATEGORIES = ["upload", "sqli", "ssti", "cms", "mfa", "saml", "cors", "openredirect", "fingerprint", "cve"]
 
 CONFIDENCE_TAGS = ("CONFIRMED", "POSSIBLE", "INFORMATIONAL")
 _CONFIDENCE_RE = re.compile(r"^\[(" + "|".join(CONFIDENCE_TAGS) + r")\]")
