@@ -15,6 +15,10 @@ Usage:
     python3 hunt.py --zero-day --target <domain>   # Run zero-day fuzzer
     python3 hunt.py --graphql --target <domain>    # Auto GraphQL audit when endpoints found
     python3 hunt.py --skip-leads --target <domain> # Skip lead_board ingest + EOL after recon
+    python3 hunt.py --rapyd-sign --target sandboxapi.rapyd.net  # Sign requests to
+                                             # sandboxapi.rapyd.net via tools/rapyd_sign.py.
+                                             # Opt-in, requires RAPYD_ACCESS_KEY/
+                                             # RAPYD_SECRET_KEY -- see run_recon() below.
 """
 
 import argparse
@@ -296,11 +300,21 @@ def select_targets(top_n=10):
     return []
 
 
-def run_recon(domain, quick=False, scope_lock=False):
-    """Run recon engine on a domain, single IP, or CIDR range."""
+def run_recon(domain, quick=False, scope_lock=False, rapyd_sign=False):
+    """Run recon engine on a domain, single IP, or CIDR range.
+
+    rapyd_sign=True passes --rapyd-sign through to recon_engine.sh, which
+    is itself opt-in and OFF by default there -- see that script's own
+    --rapyd-sign gate (checked before its Phase 1 even starts) for the
+    RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY requirement. Nothing extra needs
+    plumbing here beyond the flag itself: RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY
+    reach the subprocess automatically via child_env = os.environ.copy()
+    below, same as every other inherited env var.
+    """
     log("info", f"Running recon on {domain}...")
     script = os.path.join(TOOLS_DIR, "recon_engine.sh")
     quick_flag = "--quick" if quick else ""
+    rapyd_sign_flag = "--rapyd-sign" if rapyd_sign else ""
 
     # Detect target type and pass to recon_engine.sh
     target_type = detect_target_type(domain)
@@ -342,7 +356,7 @@ def run_recon(domain, quick=False, scope_lock=False):
     # Run with live output
     try:
         proc = subprocess.Popen(
-            f'{scope_env}{type_env}bash "{script}" "{domain}" {quick_flag}',
+            f'{scope_env}{type_env}bash "{script}" "{domain}" {quick_flag} {rapyd_sign_flag}',
             shell=True, cwd=BASE_DIR, env=child_env,
         )
         proc.wait(timeout=3600)  # 60 min timeout (CIDR ranges can be large)
@@ -546,16 +560,33 @@ def run_vuln_scan(domain, quick=False):
     if _AUTH_SESSION is not None:
         _AUTH_SESSION.export_to_env(child_env)
 
+    # Was hardcoded at 1800 with no override -- confirmed live that a
+    # single vuln_scanner.sh pass against a large target (200+ live hosts)
+    # genuinely needs longer than 30 minutes: the SQLi verification step
+    # alone took ~25 of those 30 minutes at that host count, leaving no
+    # room for the XSS/SSTI/RCE/MFA/SAML checks that come after it, which
+    # got silently killed mid-run with no summary ever written. Overridable
+    # via BBHUNT_VULN_SCAN_TIMEOUT (seconds); default unchanged at 1800 so
+    # this is a no-op for anyone not setting it.
+    timeout_raw = os.environ.get("BBHUNT_VULN_SCAN_TIMEOUT", "1800")
+    try:
+        timeout = float(timeout_raw)
+        if timeout <= 0:
+            timeout = 1800
+    except ValueError:
+        timeout = 1800
+
     try:
         proc = subprocess.Popen(
             f'bash "{script}" "{recon_dir}" {quick_flag}',
             shell=True, cwd=BASE_DIR, env=child_env,
         )
-        proc.wait(timeout=1800)
+        proc.wait(timeout=timeout)
         return proc.returncode == 0
     except subprocess.TimeoutExpired:
         proc.kill()
-        log("err", f"Vulnerability scan timed out for {domain}")
+        log("err", f"Vulnerability scan timed out for {domain} after {timeout:.0f}s "
+                    f"(override with BBHUNT_VULN_SCAN_TIMEOUT=<seconds> for large targets)")
         return False
 
 
@@ -955,6 +986,7 @@ def hunt_target(
     zero_day=False,
     skip_leads=False,
     graphql=False,
+    rapyd_sign=False,
 ):
     """Run the full hunt pipeline on a single target."""
     result = {
@@ -967,7 +999,7 @@ def hunt_target(
     }
 
     if not scan_only:
-        result["recon"] = run_recon(domain, quick=quick)
+        result["recon"] = run_recon(domain, quick=quick, rapyd_sign=rapyd_sign)
         if not result["recon"]:
             log("warn", f"Recon had issues for {domain}, continuing anyway...")
 
@@ -1012,6 +1044,38 @@ def hunt_target(
     return result
 
 
+def _check_rapyd_sign_prereqs(rapyd_sign_enabled):
+    """Fail clearly and early if --rapyd-sign was passed but
+    RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY aren't both set -- mirrors
+    recon_engine.sh's own --rapyd-sign gate exactly (same fail-loud/
+    fail-closed posture as that script's SHODAN_API_KEY check), checked
+    here too so hunt.py itself refuses immediately rather than launching
+    the tool-check/banner/recon subprocess first, only to have
+    recon_engine.sh's own gate reject it several steps later. A no-op
+    (returns True) whenever --rapyd-sign wasn't passed at all.
+
+    Factored out as its own function (rather than inlined in main()) so
+    it's directly unit-testable without having to drive the whole
+    argparse + pipeline flow.
+
+    Returns True if it's safe to proceed; calls sys.exit(1) otherwise
+    (never returns False -- there's no valid "continue anyway" caller).
+    """
+    if not rapyd_sign_enabled:
+        return True
+    missing = [
+        name for name in ("RAPYD_ACCESS_KEY", "RAPYD_SECRET_KEY")
+        if not os.environ.get(name)
+    ]
+    if missing:
+        log("err", f"{'/'.join(missing)} not set, but --rapyd-sign was passed — refusing to run.")
+        log("err", "Export both sandbox keys and re-run, e.g.:")
+        log("err", "  export RAPYD_ACCESS_KEY='yourkeyhere'")
+        log("err", "  export RAPYD_SECRET_KEY='yourkeyhere'")
+        sys.exit(1)
+    return True
+
+
 def main():
     argv = _normalize_argv(sys.argv[1:])
     parser = argparse.ArgumentParser(
@@ -1041,12 +1105,22 @@ Examples:
                         help="Run graphql_audit.sh on GraphQL URLs found in recon")
     parser.add_argument("--skip-leads", action="store_true",
                         help="Skip lead_board ingest + EOL check after recon")
+    parser.add_argument("--rapyd-sign", action="store_true",
+                        help="Sign requests to sandboxapi.rapyd.net via tools/rapyd_sign.py "
+                             "(opt-in; requires RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY)")
     parser.add_argument("--select-targets", action="store_true", help="Only run target selection")
     parser.add_argument("--top", type=int, default=10, help="Number of targets to select")
     parser.add_argument("--no-banner", action="store_true",
                         help="Suppress the startup banner (useful for CI / piped output)")
     add_cli_args(parser)
     args = parser.parse_args(argv)
+
+    # Fail clearly and early -- before the tool-check/banner/pipeline work
+    # below even starts -- if --rapyd-sign was passed without both sandbox
+    # keys set. See _check_rapyd_sign_prereqs() for why this duplicates
+    # recon_engine.sh's own gate rather than just letting that script
+    # reject it later.
+    _check_rapyd_sign_prereqs(args.rapyd_sign)
 
     # Build the auth session once. It propagates to every subprocess via
     # BBHUNT_AUTH_HEADERS / BBHUNT_SESSION_ID env vars (set per-call so the
@@ -1136,6 +1210,7 @@ Examples:
             zero_day=args.zero_day,
             skip_leads=args.skip_leads,
             graphql=args.graphql,
+            rapyd_sign=args.rapyd_sign,
         )
         print_dashboard([result])
         return
@@ -1172,6 +1247,7 @@ Examples:
             quick=args.quick,
             skip_leads=args.skip_leads,
             graphql=args.graphql,
+            rapyd_sign=args.rapyd_sign,
         )
         results.append(result)
 

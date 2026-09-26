@@ -19,6 +19,17 @@
 #   export BBHUNT_RATE_LIMIT_RPS=2                          # optional, default 2
 #   export BBHUNT_AUDIT_LOG="logs/audit.log"                # optional, default shown
 #   export BBHUNT_AUTH_HEADERS=$'Authorization: Bearer xyz\nX-Custom: val'  # optional
+#   export BBHUNT_RESEARCH_HEADER="X-HackerOne-Research: b1tr00t"  # optional,
+#                                                            # no default — unlike
+#                                                            # BBHUNT_USER_AGENT_SUFFIX,
+#                                                            # unset means "send
+#                                                            # nothing extra", not an
+#                                                            # error; see _bb_research_header()
+#   export BBHUNT_RAPYD_SIGN=1                              # optional, OFF by default —
+#                                                            # opt-in Rapyd request-signing.
+#                                                            # See _bb_rapyd_sign_headers()
+#                                                            # below for exactly what this
+#                                                            # does and doesn't cover.
 #
 #   bb_curl "https://api.target.com/v1/users/123" -s -o /tmp/out.json
 #   # ^ any trailing args after the URL are passed straight through to curl.
@@ -36,8 +47,16 @@
 #   is_in_scope <url>   — returns 0 if in scope, non-zero otherwise. Logs
 #                          blocks and hard config errors to the audit log.
 #   bb_curl <url> [curl-args...] — enforces scope + rate limit, then runs
-#                          curl with BBHUNT_AUTH_HEADERS and an identifying
-#                          User-Agent (BBHUNT_USER_AGENT_SUFFIX) attached.
+#                          curl with BBHUNT_AUTH_HEADERS, an identifying
+#                          User-Agent (BBHUNT_USER_AGENT_SUFFIX), the
+#                          optional BBHUNT_RESEARCH_HEADER, and — only when
+#                          BBHUNT_RAPYD_SIGN=1 AND the URL's host is
+#                          tools/rapyd_sign.py's hardcoded sandbox host —
+#                          Rapyd's HMAC auth headers (see
+#                          _bb_rapyd_sign_headers() below). Refuses to send
+#                          (returns 2) rather than send unsigned if signing
+#                          was requested but RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY
+#                          aren't both set.
 #                          Logs every request it actually sends, and every
 #                          request it blocks, to the audit log.
 # =============================================================================
@@ -254,6 +273,152 @@ _bb_user_agent() {
     printf '%s %s\n' "$base" "$suffix"
 }
 
+# ── Internal: optional research/attribution header ──────────────────────────
+# BBHUNT_RESEARCH_HEADER is genuinely optional, unlike BBHUNT_USER_AGENT_SUFFIX
+# above — unset or blank means "attach nothing extra", not an error. Format:
+# a single "HeaderName: value" line (e.g. "X-HackerOne-Research: b1tr00t").
+#
+# If it IS set, it must be well-formed: prints nothing and returns non-zero
+# (same signature as _bb_user_agent()) if the value contains a CR/LF (header
+# injection guard, same check used for BBHUNT_AUTH_HEADERS and
+# BBHUNT_USER_AGENT_SUFFIX) or has no ':' separator / a blank header name.
+# Callers treat a non-zero return as "attach nothing" for the unset case,
+# but see _bb_curl_impl for how a set-but-malformed value is surfaced loudly
+# instead of silently swallowed.
+_bb_research_header() {
+    local raw="${BBHUNT_RESEARCH_HEADER:-}"
+    [ -z "$raw" ] && return 1
+    case "$raw" in
+        *$'\r'*|*$'\n'*) return 2 ;;
+    esac
+    case "$raw" in
+        *:*) : ;;
+        *) return 2 ;;
+    esac
+    local name="${raw%%:*}"
+    name="$(printf '%s' "$name" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$name" ] && return 2
+    printf '%s\n' "$raw"
+    return 0
+}
+
+# ── Internal: opt-in Rapyd request signing ──────────────────────────────────
+# BBHUNT_RAPYD_SIGN=1 (opt-in, OFF by default) makes bb_curl() automatically
+# attach Rapyd's HMAC auth headers (access_key/salt/timestamp/signature) to
+# any request whose host is EXACTLY tools/rapyd_sign.py's own hardcoded
+# sandbox host — kept as a literal duplicate of that constant, not derived
+# from it, since bash can't import the Python module's value directly; if
+# rapyd_sign.py's _SANDBOX_API_HOST is ever deliberately changed, this
+# constant must be updated to match by hand, on purpose, same as any other
+# cross-language duplication in this toolkit.
+#
+# This is scoped to that ONE host on purpose: a request to api.rapyd.net
+# (production) is NEVER signed by this feature, even with BBHUNT_RAPYD_SIGN=1
+# set, because tools/rapyd_sign.py's own hardcoded gate refuses to sign
+# anything else — see rapyd_sign.py's module docstring, gate #1. Widening
+# that is a deliberate, separately-reviewed change to rapyd_sign.py, never a
+# side effect of anything in this file.
+#
+# A request to any OTHER host — including every ordinary bug-bounty target
+# this toolkit is normally pointed at — is completely unaffected whether
+# BBHUNT_RAPYD_SIGN is set or not: the host check below makes this a no-op
+# for anything that isn't the Rapyd sandbox API.
+_BB_RAPYD_SANDBOX_HOST="sandboxapi.rapyd.net"
+
+# ── Internal: best-effort method/body extraction from curl-style args ───────
+# Rapyd's signature must cover the exact HTTP method and exact body bytes
+# being sent, so bb_curl()'s own curl-args (everything after the URL) need
+# to be inspected for -X/--request and -d/--data/--data-raw/--data-binary
+# before signing. Deliberately narrow: handles the single-occurrence case
+# that's the only pattern any current bb_curl call site in this toolkit
+# actually uses (checked against every existing call site before writing
+# this) — a caller stacking multiple -d flags (curl concatenates those with
+# '&') would get an incomplete body here and a signature that doesn't match
+# what curl actually sends; there is no such call site today, but a future
+# one would need this function extended, not just used as-is.
+_bb_extract_method_from_curl_args() {
+    local prev=""
+    for _bb_a in "$@"; do
+        case "$prev" in
+            -X|--request) printf '%s\n' "$_bb_a"; return 0 ;;
+        esac
+        prev="$_bb_a"
+    done
+    for _bb_a in "$@"; do
+        case "$_bb_a" in
+            -d|--data|--data-raw|--data-binary|--data-urlencode)
+                printf 'POST\n'; return 0 ;;
+        esac
+    done
+    printf 'GET\n'
+}
+
+_bb_extract_body_from_curl_args() {
+    local prev=""
+    for _bb_a in "$@"; do
+        case "$prev" in
+            -d|--data|--data-raw|--data-binary)
+                case "$_bb_a" in
+                    @*)
+                        # curl's @file syntax -- read the same local file
+                        # curl itself would read, so the signed body matches
+                        # what curl actually sends on the wire.
+                        cat "${_bb_a#@}" 2>/dev/null
+                        ;;
+                    *)
+                        printf '%s' "$_bb_a"
+                        ;;
+                esac
+                return 0
+                ;;
+        esac
+        prev="$_bb_a"
+    done
+}
+
+# ── _bb_rapyd_sign_headers ───────────────────────────────────────────────────
+# _bb_rapyd_sign_headers <url> <method> <body>
+# No-op (prints nothing, returns 0) unless BOTH BBHUNT_RAPYD_SIGN=1 AND
+# <url>'s host is exactly $_BB_RAPYD_SANDBOX_HOST — every other combination
+# (feature off, or feature on but a different host) sends the request
+# completely unsigned and unaffected, same as before this feature existed.
+#
+# Once both of those hold, this is no longer allowed to silently do nothing:
+# RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY missing is a hard failure (prints a clear
+# error to stderr, returns 2) -- the whole point of making this opt-in is
+# that once opted in, a misconfigured environment must never fall back to
+# quietly sending an unsigned request against the host it was explicitly
+# turned on for.
+#
+# On success, prints one "Header: value" line per line to stdout (from
+# tools/rapyd_sign.py's own `sign-headers` CLI bridge -- the actual HMAC
+# math is never reimplemented here) and returns 0.
+_bb_rapyd_sign_headers() {
+    local url="$1" method="$2" body="$3"
+
+    [ "${BBHUNT_RAPYD_SIGN:-0}" = "1" ] || return 0
+
+    local host
+    host="$(_bb_extract_host "$url")"
+    [ "$host" = "$_BB_RAPYD_SANDBOX_HOST" ] || return 0
+
+    if [ -z "${RAPYD_ACCESS_KEY:-}" ] || [ -z "${RAPYD_SECRET_KEY:-}" ]; then
+        echo "[bb_curl] FATAL — BBHUNT_RAPYD_SIGN=1 but RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY are not both set — refusing to send this request to $host unsigned. export RAPYD_ACCESS_KEY=... RAPYD_SECRET_KEY=... or unset BBHUNT_RAPYD_SIGN." >&2
+        _bb_audit_log "[FATAL-RAPYD-SIGN-NO-KEYS] url=$url"
+        return 2
+    fi
+
+    local tools_dir
+    tools_dir="$(dirname "${BASH_SOURCE[0]}")"
+    local sign_output
+    if ! sign_output="$(python3 "$tools_dir/rapyd_sign.py" sign-headers --method "$method" --url "$url" --body "$body" 2>&1)"; then
+        echo "[bb_curl] FATAL — Rapyd request signing failed for $url: $sign_output" >&2
+        _bb_audit_log "[FATAL-RAPYD-SIGN-ERROR] url=$url"
+        return 2
+    fi
+    printf '%s\n' "$sign_output"
+}
+
 # ── Internal: rate limiting ──────────────────────────────────────────────────
 # Per-process minimum-interval enforcement via a global "last request" clock.
 # NOTE: this state is a plain shell variable, so it's only shared across
@@ -332,7 +497,39 @@ _bb_curl_impl() {
         return 2
     fi
 
+    local -a research_args=()
+    local research_header research_rc
+    research_header="$(_bb_research_header)"
+    research_rc=$?
+    if [ "$research_rc" -eq 0 ]; then
+        research_args+=(-H "$research_header")
+    elif [ "$research_rc" -eq 2 ]; then
+        # Set but malformed (CR/LF, no ':' separator, or blank header name)
+        # -- surfaced loudly rather than silently sending the request
+        # without the header the operator explicitly asked for.
+        echo "[bb_curl] FATAL — BBHUNT_RESEARCH_HEADER is set but invalid (expected 'HeaderName: value', no CR/LF): ${BBHUNT_RESEARCH_HEADER:-}" >&2
+        _bb_audit_log "[FATAL-BAD-RESEARCH-HEADER] BBHUNT_RESEARCH_HEADER invalid, url=$url"
+        return 2
+    fi
+    # research_rc == 1: unset/blank -- attach nothing, not an error.
+
     [ "$do_rate_limit" = "1" ] && _bb_rate_limit_wait
+
+    local -a rapyd_sign_args=()
+    local rapyd_sign_output rapyd_sign_rc
+    rapyd_sign_output="$(_bb_extract_method_from_curl_args "$@")"
+    local rapyd_method="$rapyd_sign_output"
+    rapyd_sign_output="$(_bb_rapyd_sign_headers "$url" "$rapyd_method" "$(_bb_extract_body_from_curl_args "$@")")"
+    rapyd_sign_rc=$?
+    if [ "$rapyd_sign_rc" -ne 0 ]; then
+        return "$rapyd_sign_rc"
+    fi
+    if [ -n "$rapyd_sign_output" ]; then
+        while IFS= read -r _bb_rs_line; do
+            [ -z "$_bb_rs_line" ] && continue
+            rapyd_sign_args+=(-H "$_bb_rs_line")
+        done <<< "$rapyd_sign_output"
+    fi
 
     local -a auth_args=()
     if [ "$do_auth" = "1" ] && [ -n "${BBHUNT_AUTH_HEADERS:-}" ]; then
@@ -351,9 +548,13 @@ _bb_curl_impl() {
         done <<< "$BBHUNT_AUTH_HEADERS"
     fi
 
-    _bb_audit_log "[REQUEST] url=$url ua=$user_agent"
+    if [ "${#research_args[@]}" -gt 0 ]; then
+        _bb_audit_log "[REQUEST] url=$url ua=$user_agent research_header=${research_args[1]}"
+    else
+        _bb_audit_log "[REQUEST] url=$url ua=$user_agent"
+    fi
 
-    curl -H "User-Agent: $user_agent" "${auth_args[@]}" "$url" "$@"
+    curl -H "User-Agent: $user_agent" "${auth_args[@]}" "${research_args[@]}" "${rapyd_sign_args[@]}" "$url" "$@"
 }
 
 # ── bb_curl ───────────────────────────────────────────────────────────────────
@@ -402,4 +603,71 @@ bb_curl_no_auth() {
 # before it — the requests inside the burst itself should not each wait.
 bb_curl_no_wait_no_auth() {
     _bb_curl_impl 0 0 "$@"
+}
+
+# ── bb_response_signature ────────────────────────────────────────────────────
+# bb_response_signature <url> [curl-fn]
+# Prints "STATUS:SIZE" for one GET (e.g. "200:1127"), via [curl-fn] if
+# given (default bb_curl_no_auth). Used by bb_catchall_baseline() /
+# bb_matches_baseline() below to compare whether two different paths on
+# the same host are actually distinguishable, or just the same canned
+# response. [curl-fn] exists so a caller that probes WITH auth headers
+# (bb_curl, not bb_curl_no_auth -- e.g. recon_engine.sh's Phase 5/6.5)
+# can build its baseline the same way it builds its actual probes; an
+# unauthenticated baseline compared against authenticated probe results
+# would be comparing two different things.
+bb_response_signature() {
+    local url="$1" curl_fn="${2:-bb_curl_no_auth}"
+    "$curl_fn" "$url" -sk --max-time 10 -o /dev/null -w '%{http_code}:%{size_download}' 2>/dev/null \
+        || printf '000:0\n'
+}
+
+# ── bb_catchall_baseline ────────────────────────────────────────────────────
+# bb_catchall_baseline <base-url> [curl-fn]
+# Prints the STATUS:SIZE signature (see bb_response_signature above) of a
+# deliberately nonexistent path on <base-url>. Fetch this ONCE per host,
+# before probing any specific paths on it, and compare each probed path's
+# own signature against this baseline with bb_matches_baseline() below.
+#
+# Earlier version of this fix compared each probed path against the
+# host's ROOT path ("/") instead of a second nonexistent path, as a
+# one-time per-host go/no-go check. That was wrong and caught by testing
+# it against a real (if synthetic) normally-routed host before shipping:
+# a host that simply has no index page at "/" — genuinely common, e.g.
+# an API-only backend — 404s at root exactly like a nonexistent path
+# does, which made that version flag every such host as "catchall" and
+# skip it entirely, including any real, distinct, genuinely-vulnerable
+# path it might have. Comparing one nonexistent path against another
+# nonexistent path (both of which SHOULD produce the same "not found"
+# signature on any normally-routed host) and then checking each probed
+# path against THAT baseline — rather than blanket-skipping a whole host
+# based on one aggregate guess — only ever discards a specific probed
+# path when its own response is indistinguishable from a path that
+# provably doesn't exist, and never discards a path that responds
+# differently, no matter what the host's root does.
+bb_catchall_baseline() {
+    local base_url="${1%/}" curl_fn="${2:-bb_curl_no_auth}"
+    local nonce="non_existent_$(date +%s)_$RANDOM"
+    bb_response_signature "${base_url}/${nonce}" "$curl_fn"
+}
+
+# ── bb_matches_baseline ─────────────────────────────────────────────────────
+# bb_matches_baseline <url> <baseline-signature> [curl-fn]
+# True (exit 0) if <url>'s own response signature exactly matches
+# <baseline-signature> (from bb_catchall_baseline(), fetched once per host,
+# with the same [curl-fn] passed to both calls) — i.e. this specific path's
+# response is indistinguishable from a path that's confirmed not to exist,
+# so a 200/301/302/403/whatever here is not evidence the path means
+# anything, only that this host answers every path the same way. Confirmed
+# against three real, structurally different catch-all patterns in one
+# engagement: a client-routed SPA returning its index shell for any path
+# (200), a backend API that ignores the path entirely (200, same JSON body
+# regardless), and a host applying the same blanket redirect to every path
+# (301/302). Callers that also need the status code itself (not just the
+# yes/no match) should call bb_response_signature() directly and derive
+# both from one fetch, the way Check 0/Check 9 in vuln_scanner.sh do,
+# rather than fetching the same URL twice via this wrapper.
+bb_matches_baseline() {
+    local url="$1" baseline="$2" curl_fn="${3:-bb_curl_no_auth}"
+    [ "$(bb_response_signature "$url" "$curl_fn")" = "$baseline" ]
 }

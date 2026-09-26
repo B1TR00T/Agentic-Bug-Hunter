@@ -21,6 +21,18 @@
 # picked up automatically since it's just an inherited environment variable,
 # no extra plumbing needed here. Runs as Phase 2.6, right after Phase 2.5
 # (Tech Fingerprinting) completes, feeding it that phase's raw.json.
+#
+# --rapyd-sign is opt-in and OFF by default, same SHODAN_API_KEY-style
+# posture: it requires RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY, checked up front
+# before Phase 1 (below), and refuses to run at all if either is missing
+# rather than silently falling back to unsigned requests partway through.
+# When on, it just exports BBHUNT_RAPYD_SIGN=1 for the rest of this script
+# to inherit -- the actual signing logic lives entirely in bb_curl.sh's
+# _bb_rapyd_sign_headers(), and is scoped there to ONLY
+# sandboxapi.rapyd.net (tools/rapyd_sign.py's own hardcoded sandbox-only
+# gate; production is never touched by this flag no matter what). A no-op
+# for every target other than Rapyd's own sandbox API, so it's harmless to
+# leave on across unrelated engagements.
 # =============================================================================
 
 set -o pipefail
@@ -39,20 +51,22 @@ log_step()  { echo -e "    ${CYAN}[>]${NC} $1"; }
 log_done()  { echo -e "    ${GREEN}[✓]${NC} $1"; }
 log_vuln()  { echo -e "    ${RED}[VULN]${NC} $1"; }
 
-TARGET="${1:?Usage: $0 <target> [--quick] [--shodan] [--cve-check]  (target = FQDN, IP, CIDR, or path to a file of domains/hosts)}"
+TARGET="${1:?Usage: $0 <target> [--quick] [--shodan] [--cve-check] [--rapyd-sign]  (target = FQDN, IP, CIDR, or path to a file of domains/hosts)}"
 QUICK_MODE="${2:-}"
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
-# --shodan/--cve-check can appear in any position (alongside/instead of
-# --quick), unlike QUICK_MODE's fixed $2 slot -- scanned for explicitly
-# rather than folded into the positional args so adding either never
-# disturbs the existing $1/$2 contract callers (including hunt.py) already
-# rely on.
+# --shodan/--cve-check/--rapyd-sign can appear in any position (alongside/
+# instead of --quick), unlike QUICK_MODE's fixed $2 slot -- scanned for
+# explicitly rather than folded into the positional args so adding any of
+# these never disturbs the existing $1/$2 contract callers (including
+# hunt.py) already rely on.
 SHODAN_MODE=0
 CVE_CHECK_MODE=0
+RAPYD_SIGN_MODE=0
 for _arg in "$@"; do
     [ "$_arg" = "--shodan" ] && SHODAN_MODE=1
     [ "$_arg" = "--cve-check" ] && CVE_CHECK_MODE=1
+    [ "$_arg" = "--rapyd-sign" ] && RAPYD_SIGN_MODE=1
 done
 
 # Auth-aware hunting: load BBHUNT_AUTH_HEADERS / BBHUNT_SESSION_ID into
@@ -123,6 +137,29 @@ if [ "$SHODAN_MODE" = "1" ] && [ -z "${SHODAN_API_KEY:-}" ]; then
     log_err "  export SHODAN_API_KEY='yourkeyhere'"
     exit 1
 fi
+
+# --rapyd-sign: same fail-loud/fail-closed posture as --shodan just above —
+# checked here, before Phase 1, so a missing key aborts immediately rather
+# than surfacing as a cryptic bb_curl failure deep inside Phase 5/6.5 after
+# everything else has already run. Both keys are required (not one
+# optional like NVD_API_KEY above) because tools/rapyd_sign.py's sign()
+# needs both to compute anything at all -- there's no "degraded but
+# working" mode to fall back to.
+if [ "$RAPYD_SIGN_MODE" = "1" ] && { [ -z "${RAPYD_ACCESS_KEY:-}" ] || [ -z "${RAPYD_SECRET_KEY:-}" ]; }; then
+    log_err "RAPYD_ACCESS_KEY/RAPYD_SECRET_KEY are not both set, but --rapyd-sign was passed — refusing to run."
+    log_err "Export both sandbox keys and re-run, e.g.:"
+    log_err "  export RAPYD_ACCESS_KEY='yourkeyhere'"
+    log_err "  export RAPYD_SECRET_KEY='yourkeyhere'"
+    exit 1
+fi
+
+# Export so bb_curl.sh (sourced above) picks it up in every phase that
+# calls bb_curl() -- currently Phase 5 (JS fetch) and Phase 6.5
+# (config-exposure probe). A no-op for every host except
+# sandboxapi.rapyd.net (bb_curl.sh's _bb_rapyd_sign_headers() enforces
+# that, mirroring tools/rapyd_sign.py's own hardcoded gate), so this is
+# harmless to leave set even when $TARGET isn't a Rapyd host at all.
+[ "$RAPYD_SIGN_MODE" = "1" ] && export BBHUNT_RAPYD_SIGN=1
 
 # Domain-list mode: if the target is a readable regular file, treat its
 # contents as a pre-resolved scope list (one host per line, # comments OK).
@@ -245,6 +282,7 @@ echo "  Output: $RECON_DIR/"
 echo "  Mode: $([ "$QUICK_MODE" = "--quick" ] && echo "Quick" || echo "Full")"
 echo "  Shodan: $([ "$SHODAN_MODE" = "1" ] && echo "Enabled (--shodan)" || echo "Disabled (default)")"
 echo "  CVE check: $([ "$CVE_CHECK_MODE" = "1" ] && echo "Enabled (--cve-check)" || echo "Disabled (default)")"
+echo "  Rapyd signing: $([ "$RAPYD_SIGN_MODE" = "1" ] && echo "Enabled (--rapyd-sign, sandboxapi.rapyd.net only)" || echo "Disabled (default)")"
 echo "  Time: $(date)"
 bb_auth_active && bb_auth_banner
 echo "============================================="
@@ -417,6 +455,20 @@ fi
 # Merge and deduplicate all subdomains
 cat "$RECON_DIR/subdomains/"*.txt 2>/dev/null | sort -u > "$RECON_DIR/subdomains/all.txt"
 TOTAL_SUBS=$(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)
+
+# Fallback: every source above (subfinder/amass/crt.sh/wayback) can
+# legitimately return zero results for a host that's still live and in
+# scope -- crt.sh in particular only surfaces hosts with a logged cert, and
+# a freshly-issued or internal-CA host won't have one yet. Without this,
+# Phase 2 (HTTP probing) and everything downstream silently skip even
+# though the caller explicitly asked to scan $TARGET. Seed the literal
+# requested hostname so it always gets probed at least once.
+if [ "$TOTAL_SUBS" -eq 0 ]; then
+    log_warn "All enumeration sources returned zero results — seeding the literal target hostname so Phase 2+ isn't skipped"
+    echo "$TARGET" > "$RECON_DIR/subdomains/all.txt"
+    TOTAL_SUBS=1
+fi
+
 log_ok "Total unique subdomains: $TOTAL_SUBS"
 
 fi  # end of domain-only subdomain enum block
